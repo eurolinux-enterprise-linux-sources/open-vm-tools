@@ -28,7 +28,7 @@
 
 Name:             open-vm-tools
 Version:          %{toolsversion}
-Release:          3%{?dist}
+Release:          3%{?dist}.1
 Summary:          Open Virtual Machine Tools for virtual machines hosted on VMware
 Group:            Applications/System
 License:          GPLv2
@@ -44,6 +44,7 @@ ExclusiveArch:    %{ix86} x86_64
 
 Patch1:           resolutionKMS-wayland.patch
 Patch2:           resolutionKMS-wayland-2.patch
+Patch3:           ovt-Ignore-ENXIO-errors-with-SyncDriver.patch
 
 BuildRequires:    autoconf
 BuildRequires:    automake
@@ -132,6 +133,7 @@ VMware virtual machines.
 %setup -q -n %{name}-%{version}-%{toolsbuild}
 %patch1 -p1
 %patch2 -p1
+%patch3 -p1
 
 %build
 # Required for regenerating configure script when
@@ -302,6 +304,10 @@ fi
 %{_libdir}/libvmtools.so
 
 %changelog
+* Tue Jun 05 2018 Miroslav Rezanina <mrezanin@redhat.com> - 10.1010-3.1
+- Ignore ENXIO errors with SyncDriver
+  resolves: rhbz#1582123
+
 * Tue Oct 03 2017 Richard W.M. Jones <rjones@redhat.com> - 10.1.10-3
 - New upstream version 10.1.10
   resolves: rhbz#1475608
