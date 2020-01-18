@@ -20,15 +20,15 @@
 
 %global _hardened_build 1
 %global majorversion    10.1
-%global minorversion    10
-%global toolsbuild      6082533
+%global minorversion    5
+%global toolsbuild      5055683
 %global toolsversion    %{majorversion}.%{minorversion}
 %global toolsdaemon     vmtoolsd
 %global vgauthdaemon    vgauthd
 
 Name:             open-vm-tools
 Version:          %{toolsversion}
-Release:          3%{?dist}.1
+Release:          3%{?dist}
 Summary:          Open Virtual Machine Tools for virtual machines hosted on VMware
 Group:            Applications/System
 License:          GPLv2
@@ -42,9 +42,7 @@ ExclusiveArch:    x86_64
 ExclusiveArch:    %{ix86} x86_64
 %endif
 
-Patch1:           resolutionKMS-wayland.patch
-Patch2:           resolutionKMS-wayland-2.patch
-Patch3:           ovt-Ignore-ENXIO-errors-with-SyncDriver.patch
+Patch1:           glibc-sysmacros.patch
 
 BuildRequires:    autoconf
 BuildRequires:    automake
@@ -85,13 +83,11 @@ BuildRequires:    xmlsec1-openssl-devel
 
 Requires:         coreutils
 Requires:         fuse
-Requires:         libdrm
-Requires:         iproute
+Requires:         net-tools
 Requires:         grep
 Requires:         pciutils
 Requires:         sed
 Requires:         systemd
-Requires:         systemd-libs
 Requires:         tar
 Requires:         which
 # xmlsec1-openssl needs to be added explicitly
@@ -100,7 +96,7 @@ Requires:         xmlsec1-openssl
 # open-vm-tools >= 10.0.0 do not require open-vm-tools-deploypkg
 # provided by VMware. That functionality is now available as part
 # of open-vm-tools package itself.
-Obsoletes:        open-vm-tools-deploypkg <= 10.0.5
+Obsoletes:	  open-vm-tools-deploypkg <= 10.0.5
 
 %description
 The %{name} project is an open source implementation of VMware Tools. It
@@ -131,9 +127,7 @@ VMware virtual machines.
 
 %prep
 %setup -q -n %{name}-%{version}-%{toolsbuild}
-%patch1 -p1
-%patch2 -p1
-%patch3 -p1
+%patch1 -p0
 
 %build
 # Required for regenerating configure script when
@@ -144,7 +138,6 @@ autoconf
 %configure \
     --without-kernel-modules \
     --enable-xmlsec1 \
-    --enable-resolutionkms \
     --disable-static
 sed -i -e 's! -shared ! -Wl,--as-needed\0!g' libtool
 make %{?_smp_mflags}
@@ -304,14 +297,6 @@ fi
 %{_libdir}/libvmtools.so
 
 %changelog
-* Tue Jun 05 2018 Miroslav Rezanina <mrezanin@redhat.com> - 10.1010-3.1
-- Ignore ENXIO errors with SyncDriver
-  resolves: rhbz#1582123
-
-* Tue Oct 03 2017 Richard W.M. Jones <rjones@redhat.com> - 10.1.10-3
-- New upstream version 10.1.10
-  resolves: rhbz#1475608
-
 * Thu Mar 16 2017 Ravindra Kumar <ravindrakumar@vmware.com> - 10.1.5-3
 - Need to add xmlsec1-openssl dependency explicitly.
   related: rhbz#1406901

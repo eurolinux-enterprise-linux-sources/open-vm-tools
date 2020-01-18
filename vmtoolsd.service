@@ -8,6 +8,7 @@ After=vgauthd.service
 [Service]
 ExecStart=/usr/bin/vmtoolsd
 TimeoutStopSec=5
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target

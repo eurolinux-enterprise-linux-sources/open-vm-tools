@@ -7,6 +7,7 @@ PartOf=vmtoolsd.service
 [Service]
 ExecStart=/usr/bin/VGAuthService -s
 TimeoutStopSec=5
+PrivateTmp=true
 
 [Install]
 RequiredBy=vmtoolsd.service

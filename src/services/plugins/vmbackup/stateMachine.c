@@ -86,8 +86,6 @@ VM_EMBED_VERSION(VMTOOLSD_VERSION_STRING);
 #define VMBACKUP_CONFIG_GET_INT(config, key, defVal)        \
    VMTools_ConfigGetInteger(config, "vmbackup", key, defVal)
 
-#define VMBACKUP_CFG_ENABLEVSS      "enableVSS"
-
 static VmBackupState *gBackupState = NULL;
 
 static Bool
@@ -873,7 +871,7 @@ VmBackupStartCommon(RpcInData *data,
       const gchar *cfgEntry;
    } providers[] = {
 #if defined(_WIN32)
-      { VmBackup_NewVssProvider, VMBACKUP_CFG_ENABLEVSS},
+      { VmBackup_NewVssProvider, "enableVSS" },
 #endif
       { VmBackup_NewSyncDriverProvider, "enableSyncDriver" },
       { VmBackup_NewNullProvider, NULL },
@@ -886,17 +884,8 @@ VmBackupStartCommon(RpcInData *data,
           * only allow VSS provider
           */
 #if defined(_WIN32)
-         if (VMBACKUP_CONFIG_GET_BOOL(ctx->config,
-                                      VMBACKUP_CFG_ENABLEVSS, TRUE)) {
+         if (VMBACKUP_CONFIG_GET_BOOL(ctx->config, "enableVSS", TRUE)) {
             provider = VmBackup_NewVssProvider();
-            if (provider != NULL) {
-               completer = VmBackup_NewVssCompleter(provider);
-               if (completer == NULL) {
-                  g_warning("VSS completion helper cannot be initialized.");
-                  provider->release(provider);
-                  provider = NULL;
-               }
-            }
          }
 #elif defined(_LINUX) || defined(__linux__)
          /*
@@ -912,6 +901,10 @@ VmBackupStartCommon(RpcInData *data,
          /* If no quiescing is requested only allow null provider */
          provider = VmBackup_NewNullProvider();
       }
+      if (provider == NULL) {
+         g_warning("Requested quiescing cannot be initialized.");
+         goto error;
+      }
    } else {
       /* Instantiate the sync provider. */
       for (i = 0; i < ARRAYSIZE(providers); i++) {
@@ -920,30 +913,24 @@ VmBackupStartCommon(RpcInData *data,
          if (VMBACKUP_CONFIG_GET_BOOL(ctx->config, sp->cfgEntry, TRUE)) {
             provider = sp->ctor();
             if (provider != NULL) {
-#if defined(_WIN32)
-               if (sp->cfgEntry != NULL &&
-                   Str_Strcmp(sp->cfgEntry, VMBACKUP_CFG_ENABLEVSS) == 0) {
-                  completer = VmBackup_NewVssCompleter(provider);
-                  if (completer == NULL) {
-                     g_warning("VSS completion helper cannot be initialized.");
-                     provider->release(provider);
-                     provider = NULL;
-                     continue;
-                  }
-                  break;
-               }
-#else
                break;
-#endif
             }
          }
       }
    }
 
-   if (provider == NULL) {
-      g_warning("Requested quiescing cannot be initialized.");
-      goto error;
+   ASSERT(provider != NULL);
+
+#if defined(_WIN32)
+   if (VMBACKUP_CONFIG_GET_BOOL(ctx->config, "enableVSS", TRUE)) {
+      completer = VmBackup_NewVssCompleter(provider);
+      if (completer == NULL) {
+         provider->release(provider);
+         g_warning("Requested quiescing cannot be initialized.");
+         goto error;
+      }
    }
+#endif
 
    /* Instantiate the backup state and start the operation. */
    gBackupState->ctx = data->appCtx;
