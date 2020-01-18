@@ -1,0 +1,110 @@
+From 0e4b153006ee5a88e1a60ff8e13b954bc88692ff Mon Sep 17 00:00:00 2001
+From: Miroslav Rezanina <mrezanin@redhat.com>
+Date: Fri, 1 Mar 2019 09:46:11 +0100
+Subject: [PATCH 2/2] Fix RELRO flag
+
+RH-Author: Miroslav Rezanina <mrezanin@redhat.com>
+Message-id: <1551433571-31547-1-git-send-email-mrezanin@redhat.com>
+Patchwork-id: 84750
+O-Subject: [RHEL-7.7 open-vm-tools PATCH] Fix RELRO flag
+Bugzilla: 1678576
+RH-Acked-by: Cathy Avery <cavery@redhat.com>
+RH-Acked-by: Richard Jones <rjones@redhat.com>
+
+From: Miroslav Rezanina <mrezanin@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1678576
+Brew: https://brewweb.engineering.redhat.com/brew/taskinfo?taskID=20410856
+Upstream: n/a
+
+rpmdiff for 10.3.0 based open-vm-tools reports partial RELRO on several binaries.
+This patch ensure proper hardening is used and files have full RELRO flag.
+
+Signed-off-by: Miroslav Rezanina <mreznanin@redhat.com>
+Signed-off-by: Miroslav Rezanina <mrezanin@redhat.com>
+---
+ configure.ac             | 2 +-
+ libDeployPkg/Makefile.am | 2 +-
+ libguestlib/Makefile.am  | 2 +-
+ libhgfs/Makefile.am      | 2 +-
+ libvmtools/Makefile.am   | 2 +-
+ vgauth/lib/Makefile.am   | 2 +-
+ 6 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/configure.ac b/configure.ac
+index 72dc4ff..82e2bc6 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -1526,7 +1526,7 @@ VMTOOLS_LIBS="$BUILDDIR/libvmtools/libvmtools.la $GLIB2_LIBS"
+ VMTOOLS_CPPFLAGS="-DVMTOOLS_USE_GLIB $GLIB2_CPPFLAGS"
+ 
+ PLUGIN_CPPFLAGS="$VMTOOLS_CPPFLAGS $PLUGIN_CPPFLAGS"
+-PLUGIN_LDFLAGS="-Wl,-z,defs -Wl,-lc -Wl,--as-needed -shared -module -avoid-version"
++PLUGIN_LDFLAGS="-Wl,-z,defs -Wl,-lc -Wl,--as-needed -shared -module -avoid-version -Wl,-z,relro,-z,now"
+ 
+ # Installation directories for core services plugins.
+ TEST_PLUGIN_INSTALLDIR=$datadir/open-vm-tools/tests
+diff --git a/libDeployPkg/Makefile.am b/libDeployPkg/Makefile.am
+index b4d5c9d..f4e8f8b 100644
+--- a/libDeployPkg/Makefile.am
++++ b/libDeployPkg/Makefile.am
+@@ -39,7 +39,7 @@ libDeployPkg_la_SOURCES += linuxDeploymentUtilities.h
+ libDeployPkg_la_LDFLAGS =
+ # We require GCC, so we're fine passing compiler-specific flags.
+ # Needed for OS's that don't link shared libraries against libc by default, e.g. FreeBSD
+-libDeployPkg_la_LDFLAGS += -Wl,-lc
++libDeployPkg_la_LDFLAGS += -Wl,-lc -Wl,-z,relro,-z,now
+ 
+ libDeployPkg_includedir = $(includedir)/libDeployPkg
+ 
+diff --git a/libguestlib/Makefile.am b/libguestlib/Makefile.am
+index 5181409..a21a3ff 100644
+--- a/libguestlib/Makefile.am
++++ b/libguestlib/Makefile.am
+@@ -32,7 +32,7 @@ libguestlib_la_SOURCES += vmGuestLib.c
+ libguestlib_la_LDFLAGS =
+ # We require GCC, so we're fine passing compiler-specific flags.
+ # Needed for OS's that don't link shared libraries against libc by default, e.g. FreeBSD
+-libguestlib_la_LDFLAGS += -Wl,-lc
++libguestlib_la_LDFLAGS += -Wl,-lc -Wl,-z,relro,-z,now
+ 
+ libguestlib_includedir = $(includedir)/vmGuestLib
+ 
+diff --git a/libhgfs/Makefile.am b/libhgfs/Makefile.am
+index 7609145..50573ee 100644
+--- a/libhgfs/Makefile.am
++++ b/libhgfs/Makefile.am
+@@ -41,5 +41,5 @@ libhgfs_la_LDFLAGS =
+ libhgfs_la_LDFLAGS += -Wl,-z,defs
+ # Needed for OS's that don't link shared libraries against libc by
+ #default, e.g. FreeBSD
+-libhgfs_la_LDFLAGS += -Wl,-lc
++libhgfs_la_LDFLAGS += -Wl,-lc -Wl,-z,relro,-z,now
+ 
+diff --git a/libvmtools/Makefile.am b/libvmtools/Makefile.am
+index 1971942..6a4ca74 100644
+--- a/libvmtools/Makefile.am
++++ b/libvmtools/Makefile.am
+@@ -91,5 +91,5 @@ libvmtools_la_LDFLAGS =
+ libvmtools_la_LDFLAGS += -Wl,-z,defs
+ # Needed for OS's that don't link shared libraries against libc by
+ #default, e.g. FreeBSD
+-libvmtools_la_LDFLAGS += -Wl,-lc
++libvmtools_la_LDFLAGS += -Wl,-lc -Wl,-z,relro,-z,now
+ 
+diff --git a/vgauth/lib/Makefile.am b/vgauth/lib/Makefile.am
+index bce97aa..6c0c265 100644
+--- a/vgauth/lib/Makefile.am
++++ b/vgauth/lib/Makefile.am
+@@ -59,7 +59,7 @@ libvgauth_la_LDFLAGS =
+ libvgauth_la_LDFLAGS += -Wl,-z,defs
+ # Needed for OS's that don't link shared libraries against libc by
+ #default, e.g. FreeBSD
+-libvgauth_la_LDFLAGS += -Wl,-lc
++libvgauth_la_LDFLAGS += -Wl,-lc -Wl,-z,relro,-z,now
+ 
+ # Message catalogs.
+ install-data-hook:
+-- 
+1.8.3.1
+

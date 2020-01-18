@@ -19,31 +19,30 @@
 ################################################################################
 
 %global _hardened_build 1
-%global majorversion    10.2
-%global minorversion    5
-%global toolsbuild      8068406
+%global majorversion    10.3
+%global minorversion    0
+%global toolsbuild      8931395
 %global toolsversion    %{majorversion}.%{minorversion}
 %global toolsdaemon     vmtoolsd
 %global vgauthdaemon    vgauthd
 
 Name:             open-vm-tools
 Version:          %{toolsversion}
-Release:          3%{?dist}
+Release:          2%{?dist}
 Summary:          Open Virtual Machine Tools for virtual machines hosted on VMware
 Group:            Applications/System
 License:          GPLv2
 URL:              https://github.com/vmware/%{name}
 Source0:          https://github.com/vmware/%{name}/releases/download/stable-%{version}/%{name}-%{version}-%{toolsbuild}.tar.gz
-Source1:          %{toolsdaemon}.service
-Source2:          %{vgauthdaemon}.service
-%if 0%{?rhel} >= 7
+Source1:          %{toolsdaemon}-init.service
+Source2:          %{toolsdaemon}.service
+Source3:          %{vgauthdaemon}.service
 ExclusiveArch:    x86_64
-%else
-ExclusiveArch:    %{ix86} x86_64
-%endif
 
-Patch1:           use-tirpc.patch
-Patch2:           ovt-Workaround-for-false-negative-result-when-detecting.patch
+Patch0002: 0002-Update-cloud-init-handling.patch
+Patch0003: 0003-hgfsPlugin-crash-fix.patch
+# For bz#1678576 - [ESXi][RHEL7.6] Several files lost Full RELRO
+Patch4: ovt-Fix-RELRO-flag.patch
 
 BuildRequires:    autoconf
 BuildRequires:    automake
@@ -138,8 +137,10 @@ machines.
 
 %prep
 %setup -q -n %{name}-%{version}-%{toolsbuild}
-%patch1 -p1
-%patch2 -p1
+
+%patch0002 -p1
+%patch0003 -p1
+%patch4 -p1
 
 %build
 # Required for regenerating configure script when
@@ -193,8 +194,10 @@ rm -fr %{buildroot}%{_sbindir} %{buildroot}/sbin/mount.vmhgfs
 mv %{buildroot}%{_sysconfdir}/vmware-tools/vm-support %{buildroot}%{_bindir}
 
 # Systemd unit files
-install -p -m 644 -D %{SOURCE1} %{buildroot}%{_unitdir}/%{toolsdaemon}.service
-install -p -m 644 -D %{SOURCE2} %{buildroot}%{_unitdir}/%{vgauthdaemon}.service
+install -p -m 644 -D %{SOURCE1} %{buildroot}%{_unitdir}/%{toolsdaemon}-init.service
+install -p -m 644 -D %{SOURCE2} %{buildroot}%{_unitdir}/%{toolsdaemon}.service
+install -p -m 644 -D %{SOURCE3} %{buildroot}%{_unitdir}/%{vgauthdaemon}.service
+
 
 # 'make check' in open-vm-tools rebuilds docs and ends up regenerating
 # the font file. We can add %%check secion once 'make check' is fixed
@@ -220,10 +223,12 @@ if [ -f %{_bindir}/vmware-checkvm -a                     \
 fi
 
 /sbin/ldconfig
+%systemd_post %{toolsdaemon}-init.service
 %systemd_post %{vgauthdaemon}.service
 %systemd_post %{toolsdaemon}.service
 
 %preun
+%systemd_preun %{toolsdaemon}-init.service
 %systemd_preun %{toolsdaemon}.service
 %systemd_preun %{vgauthdaemon}.service
 
@@ -247,6 +252,7 @@ fi
 
 %postun
 /sbin/ldconfig
+%systemd_postun_with_restart %{toolsdaemon}-init.service
 %systemd_postun_with_restart %{toolsdaemon}.service
 %systemd_postun_with_restart %{vgauthdaemon}.service
 # Cleanup GuestProxy certs if open-vm-tools is being uninstalled
@@ -297,6 +303,7 @@ fi
 %{_libdir}/%{name}/plugins/vmsvc/*.so
 %{_datadir}/%{name}/
 %{_udevrulesdir}/99-vmware-scsi-udev.rules
+%{_unitdir}/%{toolsdaemon}-init.service
 %{_unitdir}/%{toolsdaemon}.service
 %{_unitdir}/%{vgauthdaemon}.service
 
@@ -322,6 +329,19 @@ fi
 %{_bindir}/vmware-vgauth-smoketest
 
 %changelog
+* Wed Mar 13 2019 Miroslav Rezanina <mrezanin@redhat.com> - 10.3.0-2.el7
+- ovt-Enable-cloud-init-by-default-to-change-the-systemd-u.patch [bz#1662278]
+- ovt-Fix-RELRO-flag.patch [bz#1678576]
+- Resolves: bz#1662278
+  ([ESXi][RHEL7.7]Enable cloud-init by default to change the systemd unit file vmtoolsd.service)
+- Resolves: bz#1678576
+  ([ESXi][RHEL7.6] Several files lost Full RELRO)
+
+* Tue Feb 12 2019 Miroslav Rezanina <mrezanin@redhat.com> - 10.3.0-1
+- Updated RHEL version
+- Resolves: bz#1667549
+  ([RHEL 7.7, ESXi] Rebase open-vm-tools to 10.3.0)
+
 * Tue Aug 21 2018 Miroslav Rezanina <mrezanin@redhat.com> - 10-2.5-3
 - ovt-Workaround-for-false-negative-result-when-detecting.patch [bz#1601559]
 - Resolves: bz#1601559

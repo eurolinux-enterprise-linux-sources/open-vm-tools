@@ -1,43 +1,21 @@
-From c567bef4b4f7721ef5c0444f464a9843ba609ae2 Mon Sep 17 00:00:00 2001
+From 266e578b8480d520ecb694bd1f9dfaf88c1febc7 Mon Sep 17 00:00:00 2001
 From: Miroslav Rezanina <mrezanin@redhat.com>
-Date: Thu, 2 Aug 2018 17:14:28 +0200
-Subject: [PATCH] Workaround for false negative result when detecting
- cloud-init existance
+Date: Tue, 16 Oct 2018 07:20:56 +0200
+Subject: Update cloud-init handling
 
-RH-Author: Miroslav Rezanina <mrezanin@redhat.com>
-Message-id: <1533230068-14044-1-git-send-email-mrezanin@redhat.com>
-Patchwork-id: 81615
-O-Subject: [RHEL-7.6 open-vm-tools PATCH] Workaround for false negative result when detecting cloud-init existance
-Bugzilla: 1601559
-RH-Acked-by: Richard Jones <rjones@redhat.com>
-RH-Acked-by: Cathy Avery <cavery@redhat.com>
-
-From: Oliver Kurth <okurth@vmware.com>
-
-"cloud-init -v" cmd is used to detect if cloud-init is properly configured and
-it works on most linux distros. However in some linux distro like Amazon Linux 2,
-"cloud-init -v" will print result to stderr instead of stdout and it makes
-"forkExecAndWaitCommand" give false negative result.
-
-1. added a new bool switch in  "ForkExecAndWaitCommand" to choose
-   if we should ignore the stderr output when the return code is 0
-2. removed unnecessary reference for "ForkExecAndWaitCommand" in linuxDeploymentUtilities.c
-3. trivial change for some formatting
-
-(cherry picked from commit 443eced089b634176c6ad1f56512a43381997abc)
-Signed-off-by: Miroslav Rezanina <mrezanin@redhat.com>
+This update of cloud-init changes for 10.3.0.
 ---
- libDeployPkg/linuxDeployment.c       | 55 ++++++++++++++--------
- libDeployPkg/linuxDeploymentUtilities.c        |  3 +-
- 2 files changed, 37 insertions(+), 21 deletions(-)
+ open-vm-tools/libDeployPkg/linuxDeployment.c       | 57 ++++++++++++++--------
+ .../libDeployPkg/linuxDeploymentUtilities.c        |  3 +-
+ 2 files changed, 38 insertions(+), 22 deletions(-)
 
 diff --git a/libDeployPkg/linuxDeployment.c b/libDeployPkg/linuxDeployment.c
-index 023d41f..7bcdd0a 100644
+index 996f184..34c8b95 100644
 --- a/libDeployPkg/linuxDeployment.c
 +++ b/libDeployPkg/linuxDeployment.c
-@@ -143,7 +143,7 @@ static bool CopyFileToDirectory(const char* srcPath, const char* destPath,
+@@ -139,7 +139,7 @@ static bool CopyFileToDirectory(const char* srcPath, const char* destPath,
                                  const char* fileName);
- static int Deploy(const char* pkgName);
+ static DeployPkgStatus Deploy(const char* pkgName);
  static char** GetFormattedCommandLine(const char* command);
 -int ForkExecAndWaitCommand(const char* command);
 +int ForkExecAndWaitCommand(const char* command, bool ignoreStdErr);
@@ -116,8 +94,8 @@ index 023d41f..7bcdd0a 100644
     if (forkExecResult != 0) {
        sLog(log_info, "cloud-init is not installed");
        free(cfgFullPath);
-@@ -1191,7 +1191,7 @@ Deploy(const char* packageName)
-       deployStatus =  CloudInitSetup(tmpDirPath);
+@@ -1194,7 +1194,7 @@ Deploy(const char* packageName)
+       deployPkgStatus = CloudInitSetup(tmpDirPath);
     } else {
        sLog(log_info, "Executing traditional GOSC workflow");
 -      deploymentResult = ForkExecAndWaitCommand(command);
@@ -125,7 +103,7 @@ index 023d41f..7bcdd0a 100644
        free(command);
  
        if (deploymentResult != CUST_SUCCESS) {
-@@ -1257,7 +1257,7 @@ Deploy(const char* packageName)
+@@ -1260,7 +1260,7 @@ Deploy(const char* packageName)
     strcat(cleanupCommand, tmpDirPath);
  
     sLog(log_info, "Launching cleanup. \n");
@@ -134,7 +112,7 @@ index 023d41f..7bcdd0a 100644
        sLog(log_warning, "Error while clean up tmp directory %s: (%s)",
             tmpDirPath, strerror (errno));
     }
-@@ -1286,7 +1286,7 @@ Deploy(const char* packageName)
+@@ -1289,7 +1289,7 @@ Deploy(const char* packageName)
           int rebootComandResult = 0;
           do {
              sLog(log_info, "Rebooting\n");
@@ -143,12 +121,14 @@ index 023d41f..7bcdd0a 100644
              sleep(1);
           } while (rebootComandResult == 0);
           sLog(log_error, "telinit returned error %d\n", rebootComandResult);
-@@ -1497,11 +1497,12 @@ GetFormattedCommandLine(const char* command)
+@@ -1499,12 +1499,13 @@ GetFormattedCommandLine(const char* command)
+  * Fork off the command and wait for it to finish. Classical Linux/Unix
   * fork-and-exec.
   *
-  * @param   [IN]  command  Command to execute
+- * @param   [IN]  command  Command to execute
++ * @param   [IN]  command       Command to execute
 + * @param   [IN]  ignoreStdErr  If we ignore stderr when cmd's return code is 0
-  * @return  Return code from the process (or DEPLOY_ERROR)
+  * @return  Return code from the process (or -1)
   *
   **/
  int
@@ -157,7 +137,7 @@ index 023d41f..7bcdd0a 100644
  {
     ProcessHandle hp;
     int retval;
-@@ -1519,14 +1520,30 @@ ForkExecAndWaitCommand(const char* command)
+@@ -1522,14 +1523,30 @@ ForkExecAndWaitCommand(const char* command)
  
     Process_RunToComplete(hp, 100);
     sLog(log_info, "Customization command output: %s\n", Process_GetStdout(hp));

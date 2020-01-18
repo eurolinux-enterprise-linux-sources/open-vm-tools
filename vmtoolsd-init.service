@@ -1,0 +1,14 @@
+[Unit]
+Description=One-time configuration for vmtoolsd
+ConditionVirtualization=vmware
+ConditionPathExists=|!/etc/vmware-tools/GuestProxyData/server/cert.pem
+ConditionPathExists=|!/etc/vmware-tools/GuestProxyData/server/key.pem
+PartOf=vmtoolsd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+ExecStart=/usr/bin/vmware-guestproxycerttool -g
+
+[Install]
+RequiredBy=vmtoolsd.service

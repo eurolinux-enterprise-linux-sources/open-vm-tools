@@ -1,0 +1,30 @@
+From d415faf0c4aaad8d8ea7b5ffeb225965e30a4628 Mon Sep 17 00:00:00 2001
+From: Miroslav Rezanina <mrezanin@redhat.com>
+Date: Tue, 16 Oct 2018 07:22:40 +0200
+Subject: hgfsPlugin crash fix
+
+---
+ open-vm-tools/services/plugins/hgfsServer/hgfsPlugin.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/services/plugins/hgfsServer/hgfsPlugin.c b/services/plugins/hgfsServer/hgfsPlugin.c
+index c5ef872..129fa75 100644
+--- a/services/plugins/hgfsServer/hgfsPlugin.c
++++ b/services/plugins/hgfsServer/hgfsPlugin.c
+@@ -1090,6 +1090,13 @@ ToolsOnLoad(ToolsAppCtx *ctx)
+    }
+ 
+    /*
++    * If not running in a VMware VM, return NULL to disable the plugin.
++    */
++   if (!ctx->isVMware) {
++      return NULL;
++   }
++
++   /*
+     * Check for VM is running in a hosted environment and if so initialize
+     * the Shared Folders HGFS client redirector.
+     */
+-- 
+1.8.3.1
+
