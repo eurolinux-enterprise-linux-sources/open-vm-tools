@@ -1,5 +1,5 @@
 /*********************************************************
- * Copyright (C) 2004-2016 VMware, Inc. All rights reserved.
+ * Copyright (C) 2004-2018 VMware, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published
@@ -30,6 +30,9 @@
 #include <stdio.h>
 #include <sys/stat.h>
 #if defined(__linux__) || defined(sun)
+# if defined(__linux__)
+#  include <sys/sysmacros.h>
+# endif
 # include <sys/vfs.h>
 #elif defined(__FreeBSD__) || defined(__APPLE__)
 # include <sys/param.h>
@@ -44,7 +47,6 @@
 
 #include "vmware.h"
 #include "wiper.h"
-#include "util.h"
 #include "str.h"
 #include "strutil.h"
 #include "fileIO.h"
@@ -153,7 +155,7 @@ static Bool initDone = FALSE;
 
 /* Local functions */
 static Bool WiperIsDiskDevice(MNTINFO *mnt, struct stat *s);
-static void WiperPartitionFilter(WiperPartition *item, MNTINFO *mnt);
+static void WiperPartitionFilter(WiperPartition *item, MNTINFO *mnt, Bool shrinkableOnly);
 static unsigned char *WiperGetSpace(WiperState *state, uint64 *free, uint64 *total);
 static void WiperClean(WiperState *state);
 
@@ -408,6 +410,10 @@ WiperIsDiskDevice(MNTINFO *mnt,     // IN
  *
  *      Determine whether or not we know how to wipe a partition.
  *
+ *      When the parameter 'shrinkableOnly' is TRUE, disk will be checked
+ *      if it is really shrinkable. Otherwise only the filesystem
+ *      will be checked for support.
+ *
  * Results:
  *      None
  *
@@ -419,7 +425,8 @@ WiperIsDiskDevice(MNTINFO *mnt,     // IN
 
 static void
 WiperPartitionFilter(WiperPartition *item,         // IN/OUT
-                     MNTINFO *mnt)                 // IN
+                     MNTINFO *mnt,                 // IN
+                     Bool shrinkableOnly)          // IN
 {
    struct stat s;
    const char *comment = NULL;
@@ -440,7 +447,8 @@ WiperPartitionFilter(WiperPartition *item,         // IN/OUT
 
    if (i == ARRAYSIZE(gKnownPartitions)) {
       comment = "Unknown filesystem. Contact VMware.";
-   } else if (item->type != PARTITION_UNSUPPORTED) {
+   } else if (item->type != PARTITION_UNSUPPORTED &&
+              shrinkableOnly) {
       /*
        * If the partition is supported by the wiper library, do some other
        * checks before declaring it shrinkable.
@@ -492,7 +500,8 @@ WiperPartitionFilter(WiperPartition *item,         // IN/OUT
  */
 
 WiperPartition *
-WiperSinglePartition_Open(const char *mountPoint)      // IN
+WiperSinglePartition_Open(const char *mountPoint,      // IN
+                          Bool shrinkableOnly)         // IN
 {
    char *mntpt = NULL;
    MNTHANDLE fp;
@@ -534,7 +543,7 @@ WiperSinglePartition_Open(const char *mountPoint)      // IN
             p = NULL;
          } else {
             WiperCollectDiskMajors();
-            WiperPartitionFilter(p, mnt);
+            WiperPartitionFilter(p, mnt, shrinkableOnly);
          }
 
          goto out;
@@ -567,9 +576,10 @@ WiperSinglePartition_Open(const char *mountPoint)      // IN
  */
 
 unsigned char *
-WiperSinglePartition_GetSpace(const WiperPartition *p,  // IN
-                              uint64 *free,       // OUT
-                              uint64 *total)      // OUT
+WiperSinglePartition_GetSpace(const WiperPartition *p, // IN
+                              uint64 *avail,           // OUT/OPT
+                              uint64 *free,            // OUT/OPT
+                              uint64 *total)           // OUT
 {
 #ifdef sun
    struct statvfs statfsbuf;
@@ -594,11 +604,32 @@ WiperSinglePartition_GetSpace(const WiperPartition *p,  // IN
    blockSize = statfsbuf.f_bsize;
 #endif
 
-   if (geteuid()== 0) {
-      *free = (uint64)statfsbuf.f_bfree * blockSize;
-   } else {
-      *free = (uint64)statfsbuf.f_bavail * blockSize;
+   if (avail) {
+      /*
+       * Free blocks available to non-superuser users.
+       * This excludes reserved blocks. Mostly applicable
+       * to 'ext' file systems. Newer file systems like
+       * 'xfs' report same value for f_bavail and f_bfree.
+       */
+      *avail = (uint64)statfsbuf.f_bavail * blockSize;
    }
+
+   if (free) {
+      if (geteuid()== 0) {
+         /*
+          * Free blocks in the file system. This includes
+          * the reserved blocks too.
+          */
+         *free = (uint64)statfsbuf.f_bfree * blockSize;
+      } else {
+         /*
+          * Free blocks available to non-superuser users.
+          * This excludes reserved blocks.
+          */
+         *free = (uint64)statfsbuf.f_bavail * blockSize;
+      }
+   }
+
    *total = (uint64)statfsbuf.f_blocks * blockSize;
 
    return "";
@@ -622,7 +653,8 @@ WiperSinglePartition_GetSpace(const WiperPartition *p,  // IN
  */
 
 Bool
-WiperPartition_Open(WiperPartition_List *pl)
+WiperPartition_Open(WiperPartition_List *pl,
+                    Bool shrinkableOnly)
 {
    MNTHANDLE fp;
    DECLARE_MNTINFO(mnt);
@@ -658,7 +690,7 @@ WiperPartition_Open(WiperPartition_List *pl)
          break;
       }
 
-      WiperPartitionFilter(part, mnt);
+      WiperPartitionFilter(part, mnt, shrinkableOnly);
       DblLnkLst_LinkLast(&pl->link, &part->link);
    }
 
@@ -756,7 +788,7 @@ WiperGetSpace(WiperState *state,  // IN
               uint64 *total)      // OUT
 {
    ASSERT(state);
-   return WiperSinglePartition_GetSpace(state->p, free, total);
+   return WiperSinglePartition_GetSpace(state->p, NULL, free, total);
 }
 
 

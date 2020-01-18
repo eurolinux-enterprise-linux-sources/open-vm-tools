@@ -1,5 +1,5 @@
 /*********************************************************
- * Copyright (C) 2008-2016 VMware, Inc. All rights reserved.
+ * Copyright (C) 2008-2018 VMware, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published
@@ -117,6 +117,7 @@ typedef struct VmBackupState {
    Bool           generateManifests;
    Bool           quiesceApps;
    Bool           quiesceFS;
+   char          *excludedFileSystems;
    Bool           allowHWProvider;
    Bool           execScripts;
    Bool           enableNullDriver;
@@ -269,7 +270,7 @@ VmBackup_NewNullProvider(void);
 VmBackupSyncProvider *
 VmBackup_NewSyncDriverProvider(void);
 
-#if defined(_LINUX) || defined(__linux__)
+#if defined(__linux__)
 VmBackupSyncProvider *
 VmBackup_NewSyncDriverOnlyProvider(void);
 #endif

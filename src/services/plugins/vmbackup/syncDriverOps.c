@@ -1,5 +1,5 @@
 /*********************************************************
- * Copyright (C) 2007-2017 VMware, Inc. All rights reserved.
+ * Copyright (C) 2007-2018 VMware, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published
@@ -28,6 +28,7 @@
 #include "procMgr.h"
 #include "syncDriver.h"
 #include "util.h"
+#include "syncManifest.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -40,6 +41,7 @@ typedef struct VmBackupDriverOp {
    Bool freeze;
    Bool canceled;
    SyncDriverHandle *syncHandle;
+   SyncManifest *manifest;
 } VmBackupDriverOp;
 
 
@@ -122,6 +124,9 @@ VmBackupDriverOpQuery(VmBackupOp *_op) // IN
          break;
       }
    } else {
+      if (op->manifest != NULL) {
+         SyncManifestSend(op->manifest);
+      }
       ret = VMBACKUP_STATUS_FINISHED;
    }
 
@@ -149,7 +154,9 @@ static void
 VmBackupDriverOpRelease(VmBackupOp *_op)  // IN
 {
    VmBackupDriverOp *op = (VmBackupDriverOp *) _op;
+
    g_free(op->syncHandle);
+   SyncManifestRelease(op->manifest);
    free(op);
 }
 
@@ -229,13 +236,16 @@ VmBackupNewDriverOp(VmBackupState *state,       // IN
       success = SyncDriver_Freeze(op->volumes,
                                   useNullDriverPrefs ?
                                   state->enableNullDriver : FALSE,
-                                  op->syncHandle);
+                                  op->syncHandle,
+                                  state->excludedFileSystems);
    } else {
+      op->manifest = SyncNewManifest(state, *op->syncHandle);
       success = VmBackupDriverThaw(op->syncHandle);
    }
    if (!success) {
       g_warning("Error %s filesystems.", freeze ? "freezing" : "thawing");
       g_free(op->syncHandle);
+      SyncManifestRelease(op->manifest);
       free(op);
       op = NULL;
    }
@@ -605,7 +615,7 @@ VmBackup_NewSyncDriverProvider(void)
 }
 
 
-#if defined(_LINUX) || defined(__linux__)
+#if defined(__linux__)
 
 /*
  *-----------------------------------------------------------------------------

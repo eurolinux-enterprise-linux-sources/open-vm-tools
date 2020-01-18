@@ -1,5 +1,5 @@
 ################################################################################
-### Copyright 2013-17 VMware, Inc.  All rights reserved.
+### Copyright 2013-18 VMware, Inc.  All rights reserved.
 ###
 ### RPM SPEC file for building open-vm-tools packages.
 ###
@@ -19,9 +19,9 @@
 ################################################################################
 
 %global _hardened_build 1
-%global majorversion    10.1
+%global majorversion    10.2
 %global minorversion    5
-%global toolsbuild      5055683
+%global toolsbuild      8068406
 %global toolsversion    %{majorversion}.%{minorversion}
 %global toolsdaemon     vmtoolsd
 %global vgauthdaemon    vgauthd
@@ -42,7 +42,8 @@ ExclusiveArch:    x86_64
 ExclusiveArch:    %{ix86} x86_64
 %endif
 
-Patch1:           glibc-sysmacros.patch
+Patch1:           use-tirpc.patch
+Patch2:           ovt-Workaround-for-false-negative-result-when-detecting.patch
 
 BuildRequires:    autoconf
 BuildRequires:    automake
@@ -52,16 +53,8 @@ BuildRequires:    doxygen
 # Fuse is optional and enables vmblock-fuse
 BuildRequires:    fuse-devel
 BuildRequires:    glib2-devel >= 2.14.0
-BuildRequires:    gtk2-devel >= 2.4.0
-%if 0%{?fedora} >= 23
-# F23 split gdk-pixbuf2-devel >= 2.31.3-5 into 3 packages,
-# gdk-pixbuf2-devel, gdk-pixbuf2-modules-devel, and
-# gdk-pixbuf2-xlib-devel. gtk2-devel does not depend on
-# gdk-pixbuf2-xlib-devel. Therefore, we need to pull in
-# gdk-pixbuf2-xlib-devel dependency ourselves.
-BuildRequires:    gdk-pixbuf2-xlib-devel
-%endif
-BuildRequires:    gtkmm24-devel
+BuildRequires:    gtk3-devel >= 3.10.0
+BuildRequires:    gtkmm30-devel >= 3.10.0
 BuildRequires:    libdnet-devel
 BuildRequires:    libicu-devel
 BuildRequires:    libmspack-devel
@@ -78,16 +71,24 @@ BuildRequires:    libXtst-devel
 BuildRequires:    openssl-devel
 BuildRequires:    pam-devel
 BuildRequires:    procps-devel
+%if 0%{?fedora} >= 28
+BuildRequires:    rpcgen
+%endif
 BuildRequires:    systemd
+%if 0%{?fedora} >= 28
+BuildRequires:    libtirpc-devel
+%endif
 BuildRequires:    xmlsec1-openssl-devel
 
 Requires:         coreutils
 Requires:         fuse
-Requires:         net-tools
+Requires:         libdrm
+Requires:         iproute
 Requires:         grep
 Requires:         pciutils
 Requires:         sed
 Requires:         systemd
+Requires:         systemd-libs
 Requires:         tar
 Requires:         which
 # xmlsec1-openssl needs to be added explicitly
@@ -96,7 +97,7 @@ Requires:         xmlsec1-openssl
 # open-vm-tools >= 10.0.0 do not require open-vm-tools-deploypkg
 # provided by VMware. That functionality is now available as part
 # of open-vm-tools package itself.
-Obsoletes:	  open-vm-tools-deploypkg <= 10.0.5
+Obsoletes:        open-vm-tools-deploypkg <= 10.0.5
 
 %description
 The %{name} project is an open source implementation of VMware Tools. It
@@ -125,9 +126,20 @@ This package contains only the user-space programs and libraries of
 %{name} that are essential for developing customized applications for
 VMware virtual machines.
 
+%package          test
+Summary:          Test utilities for Open Virtual Machine Tools
+Group:            Development/Libraries
+Requires:         %{name}%{?_isa} = %{version}-%{release}
+
+%description      test
+This package contains only the test utilities for %{name} that are
+useful for verifying the functioning of %{name} in VMware virtual
+machines.
+
 %prep
 %setup -q -n %{name}-%{version}-%{toolsbuild}
-%patch1 -p0
+%patch1 -p1
+%patch2 -p1
 
 %build
 # Required for regenerating configure script when
@@ -135,10 +147,19 @@ VMware virtual machines.
 autoreconf -i
 autoconf
 
+%if 0%{?fedora} >= 28
+%global usetirpc with-tirpc
+%else
+%global usetirpc without-tirpc
+%endif
+
 %configure \
     --without-kernel-modules \
     --enable-xmlsec1 \
+    --enable-resolutionkms \
+    --%{usetirpc} \
     --disable-static
+
 sed -i -e 's! -shared ! -Wl,--as-needed\0!g' libtool
 make %{?_smp_mflags}
 
@@ -281,6 +302,7 @@ fi
 
 %files desktop
 %{_sysconfdir}/xdg/autostart/*.desktop
+%{_bindir}/vmware-user
 %{_bindir}/vmware-user-suid-wrapper
 %{_bindir}/vmware-vmblock-fuse
 %{_libdir}/%{name}/plugins/vmusr/
@@ -296,81 +318,240 @@ fi
 %{_libdir}/libvgauth.so
 %{_libdir}/libvmtools.so
 
+%files test
+%{_bindir}/vmware-vgauth-smoketest
+
 %changelog
+* Tue Aug 21 2018 Miroslav Rezanina <mrezanin@redhat.com> - 10-2.5-3
+- ovt-Workaround-for-false-negative-result-when-detecting.patch [bz#1601559]
+- Resolves: bz#1601559
+  ([ESXi][RHEL7.6] Include new open-vm-tools patches for cloud-init to work with python-2)
+
+* Mon May 14 2018 Miroslav Rezanina <mrezanin@redhat.com> - 10.2.5-2
+- Updated RHEL version
+- Resolves: bz#1527233
+  ([ESXi][RHEL7.5]Rebase open-vm-tools to 10.2.5)
+
+* Wed May 09 2018 Ravindra Kumar <ravindrakumar@vmware.com> - 10.2.5-2
+- Use tirpc for Fedora 28 onwards.
+
+* Wed May 09 2018 Ravindra Kumar <ravindrakumar@vmware.com> - 10.2.5-1
+- Package new upstream version open-vm-tools-10.2.5-8068406 (RHBZ#1431376).
+- Added use-tirpc.patch to use libtirpc instead of deprecated Sun RPC.
+- Removed wayland-crash.patch which is no longer needed.
+
+* Mon Apr 30 2018 Pete Walter <pwalter@fedoraproject.org> - 10.2.0-5
+- Rebuild for ICU 61.1
+
+* Thu Feb 08 2018 Fedora Release Engineering <releng@fedoraproject.org> - 10.2.0-4
+- Rebuilt for https://fedoraproject.org/wiki/Fedora_28_Mass_Rebuild
+
+* Fri Dec 29 2017 Ravindra Kumar <ravindrakumar@vmware.com> - 10.2.0-3
+- Patch for a Wayland related crash in the desktopEvents plugin (RHBZ#1526952).
+- gdk_set_allowed_backends() is available in version 3.10 and later only.
+
+* Mon Dec 18 2017 Ravindra Kumar <ravindrakumar@vmware.com> - 10.2.0-2
+- Build with gtk3 only on newer distros.
+
+* Fri Dec 15 2017 Ravindra Kumar <ravindrakumar@vmware.com> - 10.2.0-1
+- Package new upstream version open-vm-tools-10.2.0-7253323.
+- Remove the patches that are no longer needed.
+- New version builds with gtk3 by default.
+- Package vmware-user symlink in desktop.
+- Add a new test package for test utilities.
+- Pick a fix to a conditional from Miroslav Vadkerti <mvadkert@redhat.com>.
+
+* Thu Nov 30 2017 Pete Walter <pwalter@fedoraproject.org> - 10.1.10-4
+- Rebuild for ICU 60.1
+
+* Thu Sep 28 2017 Ravindra Kumar <ravindrakumar@vmware.com> - 10.1.10-3
+- Replaced 'net-tools' dependency with 'iproute' (RHBZ#1496134).
+- Added resolutionKMS-wayland-2.patch with some new fixes.
+
+* Fri Aug 11 2017 Kalev Lember <klember@redhat.com> - 10.1.10-2
+- Bump and rebuild for an rpm signing issue
+
+* Thu Aug 10 2017 Ravindra Kumar <ravindrakumar@vmware.com> - 10.1.10-1
+- Package new upstream version open-vm-tools-10.1.10-6082533.
+- Remove the patches that are no longer needed.
+
+* Thu Aug 03 2017 Fedora Release Engineering <releng@fedoraproject.org> - 10.1.5-7
+- Rebuilt for https://fedoraproject.org/wiki/Fedora_27_Binutils_Mass_Rebuild
+
+* Thu Jul 27 2017 Fedora Release Engineering <releng@fedoraproject.org> - 10.1.5-6
+- Rebuilt for https://fedoraproject.org/wiki/Fedora_27_Mass_Rebuild
+
+* Tue Jul 25 2017 Richard W.M. Jones <rjones@redhat.com> - 10.1.5-5
+- Fix /tmp race conditions in libDeployPkg (CVE-2015-5191).
+
+* Sun Apr 02 2017 Ravindra Kumar <ravindrakumar@vmware.com> - 10.1.5-4
+- ResolutionKMS patch for Wayland (RHBZ#1292234).
+
 * Thu Mar 16 2017 Ravindra Kumar <ravindrakumar@vmware.com> - 10.1.5-3
 - Need to add xmlsec1-openssl dependency explicitly.
-  related: rhbz#1406901
 
 * Tue Feb 28 2017 Richard W.M. Jones <rjones@redhat.com> - 10.1.5-2
 - Use 0644 permissions for udev rules file.
-  related: rhbz#1406901
 
-* Tue Feb 28 2017 Richard W.M. Jones <rjones@redhat.com> - 10.1.5-1
-- Rebase to open-vm-tools 10.1.5 from Fedora Rawhide
-  resolves: rhbz#1406901
-- Enable vgauthd.
-  resolves: rhbz#1269243
-- Add runtime dependency on pciutils (1388766).
+* Fri Feb 24 2017 Ravindra Kumar <ravindrakumar@vmware.com> - 10.1.5-1
+- Package new upstream version open-vm-tools-10.1.5-5055683 (RHBZ#1408959).
 
-* Thu Feb 02 2017 Richard W.M. Jones <rjones@redhat.com> - 10.0.5-4
-- Fix failure to quiesce filesystem when Docker containers are running
-  resolves: rhbz#1406483
-- Fix for deadlock when taking a snapshot
-  resolves: rhbz#1398802
+* Fri Feb 17 2017 Ravindra Kumar <ravindrakumar@vmware.com> - 10.1.0-1
+- Package new upstream version open-vm-tools-10.1.0-4449150 (RHBZ#1408959).
+- Remove patches that are no longer needed.
+- Build with --enable-xmlsec1 to avoid dependency on xerces-c and xml-security-c.
+- Replace _prefix/lib/udev/rules.d/ with _udevrulesdir macro.
 
-* Mon Dec 12 2016 Richard W.M. Jones <rjones@redhat.com> - 10.0.5-3
-- Increase SCSI timeouts with udev rule (RHBZ#1214347).
+* Thu Feb 16 2017 Ravindra Kumar <ravindrakumar@vmware.com> - 10.0.5-10
+- sysmacros patch for glibc-2.25 (RHBZ#1411807).
+- vgauth patch for openssl-1.1.0.
 
-* Thu Jun 16 2016 Richard W.M. Jones <rjones@redhat.com> - 10.0.5-2
-- Rebase to open-vm-tools 10.0.5 (from Fedora Rawhide)
-  resolves: rhbz#1268537
-- Remove PAM calls to pam_unix2.so module
-  resolves: rhbz#1313071
+* Thu Feb 16 2017 Ravindra Kumar <ravindrakumar@vmware.com> - 10.0.5-9
+- udev rules patch for longer SCSI timeouts (RHBZ#1214347).
 
-* Tue May 3 2016 Dave Wysochanski <dwysocha@redaht.com> - 9.10.2-5
-- Skip freezing autofs mounts.
-  resolves: rhbz#1269956
+* Sat Feb 11 2017 Fedora Release Engineering <releng@fedoraproject.org> - 10.0.5-8
+- Rebuilt for https://fedoraproject.org/wiki/Fedora_26_Mass_Rebuild
 
-* Fri Aug 14 2015 Richard W.M. Jones <rjones@redhat.com> - 9.10.2-4
-- Enable PrivateTmp for additional hardening
-  resolves: rhbz#1253698
+* Wed Oct 26 2016 Richard W.M. Jones <rjones@redhat.com> - 10.0.5-5
+- vm-support script needs lspci from pciutils (RHBZ#1388766).
 
-* Wed Jul 29 2015 Richard W.M. Jones <rjones@redhat.com> - 9.10.2-3
-- Enable deploypkg
-  resolves: rhbz#1172335
+* Wed Sep 14 2016 Ravindra Kumar <ravindrakumar@vmware.com> - 10.0.5-4
+- Patch for HGFS stale caching issues (RHBZ#1342181).
 
-* Mon Jul 27 2015 Richard W.M. Jones <rjones@redhat.com> - 9.10.2-2
-- Disable vgauthd service in vmtoolsd.service file.
-  resolves: rhbz#1172833
+* Mon Jun 20 2016 Ravindra Kumar <ravindrakumar@vmware.com> - 10.0.5-3
+- Use systemd-detect-virt to detect VMware platform (RHBZ#1251656).
+
+* Wed May 25 2016 Ravindra Kumar <ravindrakumar@vmware.com> - 10.0.5-2
+- Obsolete open-vm-tools-deploypkg because its not needed for v10.x.
+
+* Wed May 25 2016 Ravindra Kumar <ravindrakumar@vmware.com> - 10.0.5-1
+- Package new upstream version open-vm-tools-10.0.5-3227872.
+- Add a patch for fixing GCC 6 build issue (RHBZ#1305108).
+- Replace kill-werror.patch with no-unused-const.patch.
+
+* Wed May 25 2016 Richard W.M. Jones <rjones@redhat.com> - 10.0.0-12
+- Bump and rebuild.
+
+* Sat Apr 23 2016 Richard W.M. Jones <rjones@redhat.com> - 10.0.0-11
+- Kill -Werror with fire (RHBZ#1305108).
+
+* Fri Apr 15 2016 David Tardon <dtardon@redhat.com> - 10.0.0-10
+- rebuild for ICU 57.1
+
+* Thu Feb 04 2016 Fedora Release Engineering <releng@fedoraproject.org> - 10.0.0-9
+- Rebuilt for https://fedoraproject.org/wiki/Fedora_24_Mass_Rebuild
+
+* Wed Oct 28 2015 David Tardon <dtardon@redhat.com> - 10.0.0-8
+- rebuild for ICU 56.1
+
+* Thu Oct 01 2015 Ravindra Kumar <ravindrakumar@vmware.com> - 10.0.0-7
+- Added a missing output redirection
+
+* Thu Oct 01 2015 Ravindra Kumar <ravindrakumar@vmware.com> - 10.0.0-6
+- Setup Shared Folders mount point when 'vmhgf-fuse -e' is success
+
+* Thu Oct 01 2015 Ravindra Kumar <ravindrakumar@vmware.com> - 10.0.0-5
+- Setup and teardown Shared Folders mount point on VMs running
+  on VMware Workstation or VMware Fusion.
+
+* Wed Sep 30 2015 Ravindra Kumar <ravindrakumar@vmware.com> - 10.0.0-4
+- vmhgfs-fuse needs 'fusermount' from 'fuse'
+
+* Wed Sep 30 2015 Ravindra Kumar <ravindrakumar@vmware.com> - 10.0.0-3
+- Replace -std=c++11 with -std=gnu++11 to get "linux" definitions work
+  in order to fix the build issue,
+  https://kojipkgs.fedoraproject.org//work/tasks/4823/11274823/build.log
+- Removed unused definitions for CFLAGS and CXXFLAGS
+ 
+* Wed Sep 30 2015 Ravindra Kumar <ravindrakumar@vmware.com> - 10.0.0-2
+- Add -std=c++11 to CXXFLAGS for fixing the build issue,
+  https://kojipkgs.fedoraproject.org//work/tasks/3685/11273685/build.log
+
+* Tue Sep 29 2015 Ravindra Kumar <ravindrakumar@vmware.com> - 10.0.0-1
+- Package new upstream version open-vm-tools-10.0.0-3000743
+
+* Wed Aug 26 2015 Simone Caronni <negativo17@gmail.com> - 9.10.2-2
+- Add license macro.
+- Remove initscripts requirement (#1226369).
+- Delete mount.vmhgfs instead of excluding from packaging, so the debug
+  information is not included in the package (#1190540).
+- Be more explicit with configuration files, newer mock complains of files being
+  listed twice.
 
 * Tue Jul 07 2015 Ravindra Kumar <ravindrakumar@vmware.com> - 9.10.2-1
 - Package new upstream version open-vm-tools-9.10.2-2822639
 - Removed the patches that are no longer needed
-  resolves: rhbz#1172833
 
-* Wed May 20 2015 Ravindra Kumar <ravindrakumar@vmware.com> - 9.10.0-2
+* Wed Jun 17 2015 Fedora Release Engineering <rel-eng@lists.fedoraproject.org> - 9.10.0-5
+- Rebuilt for https://fedoraproject.org/wiki/Fedora_23_Mass_Rebuild
+
+* Wed May 20 2015 Ravindra Kumar <ravindrakumar@vmware.com> - 9.10.0-4
 - Claim ownership for /etc/vmware-tools directory
-  resolves: rhbz#1223498
 
-* Wed May 20 2015 Richard W.M. Jones <rjones@redhat.com> - 9.10.0-1
-- Rebase to open-vm-tools 9.10.0 (synchronizing with F22)
-  resolves: rhbz#1172833
+* Fri May 15 2015 Ravindra Kumar <ravindrakumar@vmware.com> - 9.10.0-3
+- Put Fedora 23 specific fix under a conditional, so that the change
+  can be backported to other branches easily if required.
 
-* Fri Sep 19 2014 Richard W.M. Jones <rjones@redhat.com> - 9.4.0-6
-- Really rebuild for updated procps
-  resolves: rhbz#1140149
+* Fri May 08 2015 Ravindra Kumar <ravindrakumar@vmware.com> - 9.10.0-2
+- F23 has split gdk-pixbuf2-devel >= 2.31.3-5 into 3 packages, gdk-pixbuf2-devel,
+  gdk-pixbuf2-modules-devel, and gdk-pixbuf2-xlib-devel. gtk2-devel does not depend
+  on gdk-pixbuf2-xlib-devel. Therefore, we need to pull in gdk-pixbuf2-xlib-devel
+  dependency ourselves.
 
-* Wed Sep 10 2014 Richard W.M. Jones <rjones@redhat.com> - 9.4.0-5
-- Rebuild for updated procps
-  resolves: rhbz#1140149
+* Thu Apr 30 2015 Ravindra Kumar <ravindrakumar@vmware.com> - 9.10.0-1
+- Package new upstream version open-vm-tools-9.10.0-2476743
+- New version requires adding a new service vgauthd
+- Removed old patches that are no longer needed
+- Fix (asm_x86.patch) for correct GCC version check
+- Fix (strerror_r.patch) for picking GNU signature of strerror_r
+- Fix (toolboxcmd.patch) for compiling toolboxcmd-shrink.c with gcc 5.0.1
 
-* Mon Aug 18 2014 Richard W.M. Jones <rjones@redhat.com> - 9.4.0-4
+* Wed Feb 04 2015 Ravindra Kumar <ravindrakumar@vmware.com> - 9.4.6-6
+- Added a patch for missing NetIpRouteConfigInfo (BZ#1189295)
+
+* Mon Jan 26 2015 David Tardon <dtardon@redhat.com> - 9.4.6-5
+- rebuild for ICU 54.1
+
+* Wed Sep 24 2014 Simone Caronni <negativo17@gmail.com> - 9.4.6-4
+- Rebuild for new procps-ng version.
+
+* Tue Aug 26 2014 David Tardon <dtardon@redhat.com> - 9.4.6-3
+- rebuild for ICU 53.1
+
+* Sun Aug 17 2014 Fedora Release Engineering <rel-eng@lists.fedoraproject.org> - 9.4.6-2
+- Rebuilt for https://fedoraproject.org/wiki/Fedora_21_22_Mass_Rebuild
+
+* Wed Jul 16 2014 Ravindra Kumar <ravindrakumar@vmware.com> - 9.4.6-1 
+- Package new upstream version open-vm-tools-9.4.6-1770165
+- Added "autoreconf -i" and its build dependencies (autoconf, automake and libtool)
+  to generate configure script, this is required for version 9.4.6 as it does not
+  have configure script bundled in the tar
+- Fix (sizeof_argument.patch) for bad sizeof argument error 
+
+* Sat Jun 07 2014 Fedora Release Engineering <rel-eng@lists.fedoraproject.org> - 9.4.0-10
+- Rebuilt for https://fedoraproject.org/wiki/Fedora_21_Mass_Rebuild
+
+* Wed Apr 23 2014 Ravindra Kumar <ravindrakumar@vmware.com> - 9.4.0-9
 - Removed unnecessary package dependency on 'dbus'
 - Moved 'vm-support' script to /usr/bin
 - Added a call to 'tools.set.version' RPC to inform VMware
   platform when open-vm-tools has been uninstalled
+
+* Wed Mar 26 2014 Ravindra Kumar <ravindrakumar@vmware.com> - 9.4.0-8
 - Add missing package dependency on 'which' (BZ#1045709)
+
+* Tue Mar 25 2014 Ravindra Kumar <ravindrakumar@vmware.com> - 9.4.0-7
+- Add -D_DEFAULT_SOURCE to suppress warning as suggested in
+  https://sourceware.org/bugzilla/show_bug.cgi?id=16632
+
+* Fri Mar 21 2014 Ravindra Kumar <ravindrakumar@vmware.com> - 9.4.0-6
 - Add missing package dependencies (BZ#1045709, BZ#1077320)
+
+* Tue Feb 18 2014 Igor Gnatenko <i.gnatenko.brain@gmail.com> - 9.4.0-5
+- Fix FTBFS g_info redefine (RHBZ #1063847)
+
+* Fri Feb 14 2014 David Tardon <dtardon@redhat.com> - 9.4.0-4
+- rebuild for new ICU
 
 * Tue Feb 11 2014 Richard W.M. Jones <rjones@redhat.com> - 9.4.0-3
 - Only build on x86-64 for RHEL 7 (RHBZ#1054608).

@@ -1,5 +1,5 @@
 /*********************************************************
- * Copyright (C) 2004-2016 VMware, Inc. All rights reserved.
+ * Copyright (C) 2004-2018 VMware, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published
@@ -86,7 +86,7 @@ FileTryDir(const char *dirName)  // IN: Is this a writable directory?
          return edirName;
       }
 
-      free(edirName);
+      Posix_Free(edirName);
    }
 
    return NULL;
@@ -122,7 +122,7 @@ FileGetTmpDir(Bool useConf)  // IN: Use the config file?
    if (useConf) {
       dirName = (char *)LocalConfig_GetString(NULL, "tmpDirectory");
       edirName = FileTryDir(dirName);
-      free(dirName);
+      Posix_Free(dirName);
       if (edirName != NULL) {
          return edirName;
       }
@@ -154,7 +154,7 @@ FileGetTmpDir(Bool useConf)  // IN: Use the config file?
 
    if (dirName != NULL) {
       edirName = FileTryDir(dirName);
-      free(dirName);
+      Posix_Free(dirName);
       if (edirName != NULL) {
          return edirName;
       }
@@ -221,7 +221,7 @@ FileGetUserName(uid_t uid)  // IN:
 
    if ((Posix_Getpwuid_r(uid, &pw, memPool, memPoolSize, &pw_p) != 0) ||
        pw_p == NULL) {
-      free(memPool);
+      Posix_Free(memPool);
       Warning("%s: Unable to retrieve the username associated with "
               "user ID %u.\n", __FUNCTION__, uid);
 
@@ -229,7 +229,7 @@ FileGetUserName(uid_t uid)  // IN:
    }
 
    userName = strdup(pw_p->pw_name);
-   free(memPool);
+   Posix_Free(memPool);
    if (userName == NULL) {
       Warning("%s: Not enough memory.\n", __FUNCTION__);
 
@@ -282,7 +282,7 @@ FileAcceptableSafeTmpDir(const char *dirname,  // IN:
           * effective user with permissions 'mode'.
           */
 
-         if (0 == Posix_Lstat(dirname, &st)) {
+         if (Posix_Lstat(dirname, &st) == 0) {
             /*
              * Our directory inherited S_ISGID if its parent had it. So it
              * is important to ignore that bit, and it is safe to do so
@@ -346,7 +346,7 @@ FileFindExistingSafeTmpDir(uid_t userId,            // IN:
    numFiles = File_ListDirectory(baseTmpDir, &fileList);
 
    if (numFiles == -1) {
-      free(pattern);
+      Posix_Free(pattern);
 
       return NULL;
    }
@@ -361,12 +361,12 @@ FileFindExistingSafeTmpDir(uid_t userId,            // IN:
              break;
           }
 
-          free(path);
+          Posix_Free(path);
        }
    }
 
    Util_FreeStringList(fileList, numFiles);
-   free(pattern);
+   Posix_Free(pattern);
 
    return tmpDir;
 }
@@ -409,7 +409,7 @@ FileCreateSafeTmpDir(uid_t userId,            // IN:
                             PRODUCT_GENERIC_NAME_LOWER, userName,
                             FileSimpleRandom());
 
-      if (!tmpDir) {
+      if (tmpDir == NULL) {
          Warning("%s: Out of memory error.\n", __FUNCTION__);
          break;
       }
@@ -422,18 +422,177 @@ FileCreateSafeTmpDir(uid_t userId,            // IN:
          Warning("%s: Failed to create a safe temporary directory, path "
                  "\"%s\". The maximum number of attempts was exceeded.\n",
                  __FUNCTION__, tmpDir);
-         free(tmpDir);
+         Posix_Free(tmpDir);
          tmpDir = NULL;
          break;
       }
 
-      free(tmpDir);
+      Posix_Free(tmpDir);
       tmpDir = NULL;
    }
 
    return tmpDir;
 }
 #endif // __linux__
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * FileGetSafeTmpDir --
+ *
+ *      Return a safe temporary directory (i.e. a temporary directory which
+ *      is not prone to symlink attacks, because it is only writable by the
+ *      current effective user).
+ *
+ *      Guaranteed to return the same directory, based on the randomTemp
+ *      boolean argument, every time it is called during the lifetime of
+ *      the current process, for the current effective user ID. (Barring
+ *      the user manually deleting or renaming the directory.)
+ *
+ * Results:
+ *      The allocated directory path on success.
+ *      NULL on failure.
+ *
+ * Side effects:
+ *      None.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static char *
+FileGetSafeTmpDir(Bool useConf,     // IN:
+                  Bool randomTemp)  // IN:
+{
+   char *tmpDir = NULL;
+
+#if defined(__FreeBSD__) || defined(sun)
+   tmpDir = FileGetTmpDir(useConf);
+#else
+   static Atomic_Ptr lckStorage;
+   static char *safeDir;
+   static char *safeRandomDir;
+   char *testSafeDir;
+   char *baseTmpDir = NULL;
+   char *userName = NULL;
+   uid_t userId;
+   MXUserExclLock *lck;
+
+   userId = geteuid();
+
+   /* Get and take lock for our safe dir. */
+   lck = MXUser_CreateSingletonExclLock(&lckStorage, "getSafeTmpDirLock",
+                                        RANK_getSafeTmpDirLock);
+
+   MXUser_AcquireExclLock(lck);
+
+   /*
+    * Based on the randomTemp boolean argument, check if we've created a
+    * temporary dir already and if it is still usable.
+    */
+
+   testSafeDir = randomTemp ? safeRandomDir : safeDir;
+   if (testSafeDir && FileAcceptableSafeTmpDir(testSafeDir, userId)) {
+      tmpDir = Util_SafeStrdup(testSafeDir);
+      goto exit;
+   }
+
+   /* We don't have a useable temporary dir, create one. */
+   baseTmpDir = FileGetTmpDir(useConf);
+
+   if (baseTmpDir == NULL) {
+      Warning("%s: FileGetTmpDir failed.\n", __FUNCTION__);
+      goto exit;
+   }
+
+   userName = FileGetUserName(userId);
+
+   if (userName == NULL) {
+      Warning("%s: FileGetUserName failed, using numeric ID "
+              "as username instead.\n", __FUNCTION__);
+
+      /* Fallback on just using the userId as the username. */
+      userName = Str_Asprintf(NULL, "uid_%d", userId);
+
+      if (userName == NULL) {
+         Warning("%s: Str_Asprintf error.\n", __FUNCTION__);
+         goto exit;
+      }
+   }
+
+   if (randomTemp) {
+      /*
+       * Suffix the userName with the PID for the cases where the
+       * EUID may toggle during the lifetime of the process.
+       */
+
+      char *userNameAndPid;
+      pid_t pid = getpid();
+
+      userNameAndPid = Str_Asprintf(NULL, "%s_%d", userName, pid);
+
+      if (userNameAndPid == NULL) {
+         Warning("%s: Str_Asprintf error.\n", __FUNCTION__);
+         goto exit;
+      }
+
+      Posix_Free(userName);
+      userName = userNameAndPid;
+   }
+
+   tmpDir = Str_Asprintf(NULL, "%s%s%s-%s", baseTmpDir, DIRSEPS,
+                         PRODUCT_GENERIC_NAME_LOWER, userName);
+
+   if (tmpDir == NULL) {
+      Warning("%s: Out of memory error.\n", __FUNCTION__);
+      goto exit;
+   }
+
+   if (randomTemp || !FileAcceptableSafeTmpDir(tmpDir, userId)) {
+      /*
+       * Either we want a truely random temp directory or we didn't get
+       * our first choice for the safe temp directory.
+       * Search through the unsafe tmp directory to see if there is
+       * an acceptable one to use.
+       */
+
+      Posix_Free(tmpDir);
+
+      tmpDir = FileFindExistingSafeTmpDir(userId, userName, baseTmpDir);
+
+      if (tmpDir == NULL) {
+         /*
+          * We didn't find any usable directories, so try to create one now.
+          */
+
+         tmpDir = FileCreateSafeTmpDir(userId, userName, baseTmpDir);
+      }
+   }
+
+   if (tmpDir != NULL) {
+      /*
+       * We have successfully created a temporary directory, remember it for
+       * future calls.
+       */
+
+      testSafeDir = Util_SafeStrdup(tmpDir);
+      if (randomTemp) {
+         Posix_Free(safeRandomDir);
+         safeRandomDir = testSafeDir;
+      } else {
+         Posix_Free(safeDir);
+         safeDir = testSafeDir;
+      }
+   }
+
+  exit:
+   MXUser_ReleaseExclLock(lck);
+   Posix_Free(baseTmpDir);
+   Posix_Free(userName);
+#endif
+
+   return tmpDir;
+}
 
 
 /*
@@ -463,103 +622,36 @@ FileCreateSafeTmpDir(uid_t userId,            // IN:
 char *
 File_GetSafeTmpDir(Bool useConf)  // IN:
 {
-   char *tmpDir;
+   return  FileGetSafeTmpDir(useConf, FALSE);
+}
 
-#if defined(__FreeBSD__) || defined(sun)
-   tmpDir = FileGetTmpDir(useConf);
-#else
-   static Atomic_Ptr lckStorage;
-   static char *safeDir;
-   char *baseTmpDir = NULL;
-   char *userName = NULL;
-   uid_t userId;
-   MXUserExclLock *lck;
 
-   userId = geteuid();
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * File_GetSafeRandomTmpDir --
+ *
+ *      Return a safe, random temporary directory (i.e. a temporary directory
+ *      which is not prone to symlink attacks, because it is only writable
+ *      by the current effective user).
+ *
+ *      Guaranteed to return the same directory every time it is
+ *      called during the lifetime of the current process, for the
+ *      current effective user ID. (Barring the user manually deleting
+ *      or renaming the directory.)
+ *
+ * Results:
+ *      The allocated directory path on success.
+ *      NULL on failure.
+ *
+ * Side effects:
+ *      None.
+ *
+ *-----------------------------------------------------------------------------
+ */
 
-   /* Get and take lock for our safe dir. */
-   lck = MXUser_CreateSingletonExclLock(&lckStorage, "getSafeTmpDirLock",
-                                        RANK_getSafeTmpDirLock);
-
-   MXUser_AcquireExclLock(lck);
-
-   /*
-    * Check if we've created a temporary dir already and if it is still usable.
-    */
-
-   tmpDir = NULL;
-
-   if (safeDir && FileAcceptableSafeTmpDir(safeDir, userId)) {
-      tmpDir = Util_SafeStrdup(safeDir);
-      goto exit;
-   }
-
-   /* We don't have a useable temporary dir, create one. */
-   baseTmpDir = FileGetTmpDir(useConf);
-
-   if (!baseTmpDir) {
-      Warning("%s: FileGetTmpDir failed.\n", __FUNCTION__);
-      goto exit;
-   }
-
-   userName = FileGetUserName(userId);
-
-   if (!userName) {
-      Warning("%s: FileGetUserName failed, using numeric ID "
-              "as username instead.\n", __FUNCTION__);
-
-      /* Fallback on just using the userId as the username. */
-      userName = Str_Asprintf(NULL, "uid-%d", userId);
-
-      if (!userName) {
-         Warning("%s: Str_Asprintf error.\n", __FUNCTION__);
-         goto exit;
-      }
-   }
-
-   tmpDir = Str_Asprintf(NULL, "%s%s%s-%s", baseTmpDir, DIRSEPS,
-                         PRODUCT_GENERIC_NAME_LOWER, userName);
-
-   if (!tmpDir) {
-      Warning("%s: Out of memory error.\n", __FUNCTION__);
-      goto exit;
-   }
-
-   if (!FileAcceptableSafeTmpDir(tmpDir, userId)) {
-      /*
-       * We didn't get our first choice for the safe temp directory.
-       * Search through the unsafe tmp directory to see if there is
-       * an acceptable one to use.
-       */
-
-      free(tmpDir);
-
-      tmpDir = FileFindExistingSafeTmpDir(userId, userName, baseTmpDir);
-
-      if (!tmpDir) {
-         /*
-          * We didn't find any usable directories, so try to create one now.
-          */
-
-         tmpDir = FileCreateSafeTmpDir(userId, userName, baseTmpDir);
-      }
-   }
-
-   if (tmpDir) {
-      /*
-       * We have successfully created a temporary directory, remember it for
-       * future calls.
-       */
-
-      free(safeDir);
-      safeDir = Util_SafeStrdup(tmpDir);
-   }
-
-  exit:
-   MXUser_ReleaseExclLock(lck);
-   free(baseTmpDir);
-   free(userName);
-#endif
-
-   return tmpDir;
+char *
+File_GetSafeRandomTmpDir(Bool useConf)  // IN:
+{
+   return FileGetSafeTmpDir(useConf, TRUE);
 }

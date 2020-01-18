@@ -1,5 +1,5 @@
 /*********************************************************
- * Copyright (C) 1998-2016 VMware, Inc. All rights reserved.
+ * Copyright (C) 1998-2018 VMware, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published
@@ -59,9 +59,6 @@
 #include <mach/vm_map.h>
 #include <sys/mman.h>
 #include <AvailabilityMacros.h>
-#if MAC_OS_X_VERSION_MIN_REQUIRED < 1070 // Must run on Mac OS versions < 10.7
-#   include <dlfcn.h>
-#endif
 #elif defined(__FreeBSD__)
 #if !defined(RLIMIT_AS)
 #  if defined(RLIMIT_VMEM)
@@ -127,6 +124,7 @@
 
 #if defined(__APPLE__)
 #include "utilMacos.h"
+#include "rateconv.h"
 #endif
 
 #if defined(VMX86_SERVER)
@@ -153,23 +151,28 @@ struct hostinfoOSVersion {
 
 static Atomic_Ptr hostinfoOSVersion;
 
-#define DISTRO_BUF_SIZE 255
+#define DISTRO_BUF_SIZE 1024
 
 #if !defined __APPLE__ && !defined USERWORLD
-typedef struct lsb_distro_info {
+typedef struct {
    char *name;
-   char *scanstring;
-} LSBDistroInfo;
+   char *scanString;
+} DistroNameScan;
 
-static const LSBDistroInfo lsbFields[] = {
-   {"DISTRIB_ID=",          "DISTRIB_ID=%s"},
-   {"DISTRIB_RELEASE=",     "DISTRIB_RELEASE=%s"},
-   {"DISTRIB_CODENAME=",    "DISTRIB_CODENAME=%s"},
-   {"DISTRIB_DESCRIPTION=", "DISTRIB_DESCRIPTION=%s"},
-   {NULL, NULL},
+static const DistroNameScan lsbFields[] = {
+   {"DISTRIB_ID=",          "DISTRIB_ID=%s"          },
+   {"DISTRIB_RELEASE=",     "DISTRIB_RELEASE=%s"     },
+   {"DISTRIB_CODENAME=",    "DISTRIB_CODENAME=%s"    },
+   {"DISTRIB_DESCRIPTION=", "DISTRIB_DESCRIPTION=%s" },
+   {NULL,                   NULL                     },
 };
 
-typedef struct distro_info {
+static const DistroNameScan osReleaseFields[] = {
+   {"PRETTY_NAME=",        "PRETTY_NAME=%s"          },
+   {NULL,                   NULL                     },
+};
+
+typedef struct {
    char *name;
    char *filename;
 } DistroInfo;
@@ -463,6 +466,202 @@ Hostinfo_GetSystemBitness(void)
 }
 
 
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * HostinfoPostData --
+ *
+ *      Post the OS name data to their cached values.
+ *
+ * Return value:
+ *      None
+ *
+ * Side effects:
+ *      None
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static void
+HostinfoPostData(const char *osName,  // IN:
+                 char *osNameFull)    // IN:
+{
+   unsigned int lastCharPos;
+   static Atomic_uint32 mutex = {0};
+
+   /*
+    * Before returning, truncate the newline character at the end of the full
+    * name.
+    */
+
+   lastCharPos = strlen(osNameFull) - 1;
+   if (osNameFull[lastCharPos] == '\n') {
+      osNameFull[lastCharPos] = '\0';
+   }
+
+   /*
+    * Serialize access. Collisions should be rare - plus the value will get
+    * cached and this won't get called anymore.
+    */
+
+   while (Atomic_ReadWrite(&mutex, 1)); // Spinlock.
+
+   if (!HostinfoOSNameCacheValid) {
+      Str_Strcpy(HostinfoCachedOSName, osName, sizeof HostinfoCachedOSName);
+      Str_Strcpy(HostinfoCachedOSFullName, osNameFull,
+                 sizeof HostinfoCachedOSFullName);
+      HostinfoOSNameCacheValid = TRUE;
+   }
+
+   Atomic_Write(&mutex, 0);  // unlock
+}
+
+
+#if defined(__APPLE__) // MacOS
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * HostinfoMacOS --
+ *
+ *      Determine the specifics concerning MacOS.
+ *
+ * Return value:
+ *      Returns TRUE on success and FALSE on failure.
+ *
+ * Side effects:
+ *      Cache values are set when returning TRUE.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static Bool
+HostinfoMacOS(struct utsname *buf)  // IN:
+{
+   int len;
+   unsigned int i;
+   char *productName;
+   char *productVersion;
+   char *productBuildVersion;
+   char osName[MAX_OS_NAME_LEN];
+   char osNameFull[MAX_OS_FULLNAME_LEN];
+   Bool haveVersion = FALSE;
+   static char const *versionPlists[] = {
+      "/System/Library/CoreServices/ServerVersion.plist",
+      "/System/Library/CoreServices/SystemVersion.plist"
+   };
+
+   /*
+    * Read the version info from ServerVersion.plist or SystemVersion.plist.
+    * Mac OS Server (10.6 and earlier) has both files, and the product name in
+    * ServerVersion.plist is "Mac OS X Server". Client versions of Mac OS only
+    * have SystemVersion.plist with the name "Mac OS X".
+    *
+    * This is better than executing system_profiler or sw_vers, or using the
+    * deprecated Gestalt() function (which only gets version numbers).
+    * All of those methods just read the same plist files anyway.
+    */
+
+   for (i = 0; !haveVersion && i < ARRAYSIZE(versionPlists); i++) {
+      CFDictionaryRef versionDict =
+         UtilMacos_CreateCFDictionaryWithContentsOfFile(versionPlists[i]);
+      if (versionDict != NULL) {
+         haveVersion = UtilMacos_ReadSystemVersion(versionDict,
+                                                   &productName,
+                                                   &productVersion,
+                                                   &productBuildVersion);
+         CFRelease(versionDict);
+      }
+   }
+
+   if (haveVersion) {
+      len = Str_Snprintf(osNameFull, sizeof osNameFull,
+                         "%s %s (%s) %s %s", productName, productVersion,
+                         productBuildVersion, buf->sysname, buf->release);
+
+      free(productName);
+      free(productVersion);
+      free(productBuildVersion);
+   } else {
+      Log("%s: Failed to read system version plist.\n", __FUNCTION__);
+
+      len = Str_Snprintf(osNameFull, sizeof osNameFull, "%s %s", buf->sysname,
+                         buf->release);
+   }
+
+   if (len != -1) {
+      if (Hostinfo_GetSystemBitness() == 64) {
+         len = Str_Snprintf(osName, sizeof osName, "%s%d%s", STR_OS_MACOS,
+                            Hostinfo_OSVersion(0), STR_OS_64BIT_SUFFIX);
+      } else {
+         len = Str_Snprintf(osName, sizeof osName, "%s%d", STR_OS_MACOS,
+                            Hostinfo_OSVersion(0));
+      }
+   }
+
+   if (len == -1) {
+      Warning("%s: Error: buffer too small\n", __FUNCTION__);
+   } else {
+      HostinfoPostData(osName, osNameFull);
+   }
+
+   return (len != -1);
+}
+#endif
+
+
+#if defined(USERWORLD)  // ESXi
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * HostinfoESX --
+ *
+ *      Determine the specifics concerning ESXi.
+ *
+ * Return value:
+ *      TRUE   Success
+ *      FALSE  Failure
+ *
+ * Side effects:
+ *      Cache values are set when returning TRUE.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static Bool
+HostinfoESX(struct utsname *buf)  // IN:
+{
+   int len;
+   char osName[MAX_OS_NAME_LEN];
+   char osNameFull[MAX_OS_FULLNAME_LEN];
+
+   /* The most recent osName always goes here. */
+   Str_Strcpy(osName, "vmkernel65", sizeof osName);
+
+   /* Handle any special cases */
+   if ((buf->release[0] <= '4') && (buf->release[1] == '.')) {
+      Str_Strcpy(osName, "vmkernel", sizeof osName);
+   } else if ((buf->release[0] == '5') && (buf->release[1] == '.')) {
+      Str_Strcpy(osName, "vmkernel5", sizeof osName);
+   } else if ((buf->release[0] >= '6') && (buf->release[1] == '.')) {
+      if (buf->release[2] < '5') {
+         Str_Strcpy(osName, "vmkernel6", sizeof osName);
+      }
+   }
+
+   len = Str_Snprintf(osNameFull, sizeof osNameFull, "VMware ESXi %s",
+                      buf->release);
+
+   if (len == -1) {
+      Warning("%s: Error: buffer too small\n", __FUNCTION__);
+   } else {
+      HostinfoPostData(osName, osNameFull);
+   }
+
+   return (len != -1);
+}
+#endif
+
+
 #if !defined __APPLE__ && !defined USERWORLD
 /*
  *-----------------------------------------------------------------------------
@@ -487,17 +686,8 @@ HostinfoGetOSShortName(char *distro,         // IN: full distro name
                        int distroShortSize)  // IN: size of short distro name
 
 {
-   char *distroLower = NULL;  /* Lower case distro name */
+   char *distroLower = Util_SafeStrdup(distro);
 
-   distroLower = calloc(strlen(distro) + 1, sizeof *distroLower);
-
-   if (distroLower == NULL) {
-      Warning("%s: could not allocate memory\n", __FUNCTION__);
-
-      return;
-   }
-
-   Str_Strcpy(distroLower, distro, distroShortSize);
    distroLower = Str_ToLower(distroLower);
 
    if (strstr(distroLower, "red hat")) {
@@ -512,7 +702,7 @@ HostinfoGetOSShortName(char *distro,         // IN: full distro name
          int release = 0;
          char *releaseStart = strstr(distroLower, "release");
 
-         if (releaseStart) {
+         if (releaseStart != NULL) {
             sscanf(releaseStart, "release %d", &release);
             if (release > 0) {
                snprintf(distroShort, distroShortSize, STR_OS_RED_HAT_EN"%d",
@@ -521,8 +711,6 @@ HostinfoGetOSShortName(char *distro,         // IN: full distro name
          }
 
          if (release <= 0) {
-            Warning("%s: could not read Red Hat Enterprise release version\n",
-                  __FUNCTION__);
             Str_Strcpy(distroShort, STR_OS_RED_HAT_EN, distroShortSize);
          }
 
@@ -533,8 +721,12 @@ HostinfoGetOSShortName(char *distro,         // IN: full distro name
       Str_Strcpy(distroShort, STR_OS_OPENSUSE, distroShortSize);
    } else if (strstr(distroLower, "suse")) {
       if (strstr(distroLower, "enterprise")) {
-         if (strstr(distroLower, "server 12") ||
-             strstr(distroLower, "desktop 12")) {
+         if (strstr(distroLower, "server 15") ||
+             strstr(distroLower, "desktop 15")) {
+            Str_Strcpy(distroShort, STR_OS_SLES_15, distroShortSize);
+         } else if (strstr(distroLower, "server 12") ||
+                    strstr(distroLower, "server for sap applications 12") ||
+                    strstr(distroLower, "desktop 12")) {
             Str_Strcpy(distroShort, STR_OS_SLES_12, distroShortSize);
          } else if (strstr(distroLower, "server 11") ||
                     strstr(distroLower, "desktop 11")) {
@@ -558,6 +750,16 @@ HostinfoGetOSShortName(char *distro,         // IN: full distro name
       Str_Strcpy(distroShort, STR_OS_TURBO, distroShortSize);
    } else if (strstr(distroLower, "sun")) {
       Str_Strcpy(distroShort, STR_OS_SUN_DESK, distroShortSize);
+   } else if (strstr(distroLower, "amazon")) {
+      int amazonMajor = 0;
+
+      if (sscanf(distroLower, "amazon linux %d", &amazonMajor) != 1) {
+         /* Oldest known good release */
+         amazonMajor = 2;
+      }
+
+      Str_Sprintf(distroShort, distroShortSize, "%s%d", STR_OS_AMAZON,
+                  amazonMajor);
    } else if (strstr(distroLower, "annvix")) {
       Str_Strcpy(distroShort, STR_OS_ANNVIX, distroShortSize);
    } else if (strstr(distroLower, "arch")) {
@@ -576,6 +778,9 @@ HostinfoGetOSShortName(char *distro,         // IN: full distro name
    } else if (strstr(distroLower, "asianux server 7") ||
               strstr(distroLower, "asianux client 7")) {
       Str_Strcpy(distroShort, STR_OS_ASIANUX_7, distroShortSize);
+   } else if (strstr(distroLower, "asianux server 8") ||
+              strstr(distroLower, "asianux client 8")) {
+      Str_Strcpy(distroShort, STR_OS_ASIANUX_8, distroShortSize);
    } else if (strstr(distroLower, "aurox")) {
       Str_Strcpy(distroShort, STR_OS_AUROX, distroShortSize);
    } else if (strstr(distroLower, "black cat")) {
@@ -587,6 +792,8 @@ HostinfoGetOSShortName(char *distro,         // IN: full distro name
          Str_Strcpy(distroShort, STR_OS_CENTOS6, distroShortSize);
       } else if (strstr(distroLower, "7.")) {
          Str_Strcpy(distroShort, STR_OS_CENTOS7, distroShortSize);
+      } else if (strstr(distroLower, "8.")) {
+         Str_Strcpy(distroShort, STR_OS_CENTOS8, distroShortSize);
       } else {
          Str_Strcpy(distroShort, STR_OS_CENTOS, distroShortSize);
       }
@@ -621,6 +828,8 @@ HostinfoGetOSShortName(char *distro,         // IN: full distro name
          Str_Strcpy(distroShort, STR_OS_ORACLE6, distroShortSize);
       } else if (strstr(distroLower, "7.")) {
          Str_Strcpy(distroShort, STR_OS_ORACLE7, distroShortSize);
+      } else if (strstr(distroLower, "8.")) {
+         Str_Strcpy(distroShort, STR_OS_ORACLE8, distroShortSize);
       } else {
          Str_Strcpy(distroShort, STR_OS_ORACLE, distroShortSize);
       }
@@ -656,6 +865,8 @@ HostinfoGetOSShortName(char *distro,         // IN: full distro name
       Str_Strcpy(distroShort, STR_OS_VALINUX, distroShortSize);
    } else if (strstr(distroLower, "yellow dog")) {
       Str_Strcpy(distroShort, STR_OS_YELLOW_DOG, distroShortSize);
+   } else if (strstr(distroLower, "vmware photon")) {
+      Str_Strcpy(distroShort, STR_OS_PHOTON, distroShortSize);
    }
 
    free(distroLower);
@@ -667,12 +878,16 @@ HostinfoGetOSShortName(char *distro,         // IN: full distro name
  *
  * HostinfoReadDistroFile --
  *
- *      Look for a distro version file /etc/xxx-release.
- *      Once found, read the file in and figure out which distribution.
+ *      Attempt to open and read the specified distro identification file.
+ *      If the file has data and can be read, attempt to identify the distro.
+ *
+ *      os-release rules require strict compliance. No data unless things
+ *      are perfect. For the LSB, we will return the contents of the file
+ *      even if things aren't strictly compliant.
  *
  * Return value:
- *      Returns TRUE on success and FALSE on failure.
- *      Returns distro information verbatium from /etc/xxx-release (distro).
+ *      TRUE   Success.
+ *      FALSE  Failure.
  *
  * Side effects:
  *      None
@@ -681,18 +896,18 @@ HostinfoGetOSShortName(char *distro,         // IN: full distro name
  */
 
 static Bool
-HostinfoReadDistroFile(char *filename,  // IN: distro version file name
-                       int distroSize,  // IN: size of OS distro name buffer
-                       char *distro)    // OUT: full distro name
+HostinfoReadDistroFile(Bool osReleaseRules,           // IN: osRelease rules
+                       char *filename,                // IN: distro file
+                       const DistroNameScan *values,  // IN: search strings
+                       int distroSize,                // IN: length of distro
+                       char *distro)                  // OUT: full distro name
 {
-   int fd = -1;
+   int i;
    int buf_sz;
    struct stat st;
+   int fd = -1;
    Bool ret = FALSE;
    char *distroOrig = NULL;
-   char distroPart[DISTRO_BUF_SIZE];
-   char *tmpDistroPos = NULL;
-   int i = 0;
 
    /* It's OK for the file to not exist, don't warn for this.  */
    if ((fd = Posix_Open(filename, O_RDONLY)) == -1) {
@@ -731,20 +946,23 @@ HostinfoReadDistroFile(char *filename,  // IN: distro version file name
    distroOrig[buf_sz - 1] = '\0';
 
    /*
-    * For the case where we do have a release file in the LSB format,
-    * but there is no LSB module, let's parse the LSB file for possible fields.
+    * Attempt to parse a file with one name=value pair per line. Values are
+    * expected to embedded in double quotes.
     */
 
    distro[0] = '\0';
 
-   for (i = 0; lsbFields[i].name != NULL; i++) {
-      tmpDistroPos = strstr(distroOrig, lsbFields[i].name);
-      if (tmpDistroPos) {
-         sscanf(tmpDistroPos, lsbFields[i].scanstring, distroPart);
+   for (i = 0; values[i].name != NULL; i++) {
+      const char *tmpDistroPos = strstr(distroOrig, values[i].name);
+
+      if (tmpDistroPos != NULL) {
+         char distroPart[DISTRO_BUF_SIZE];
+
+         sscanf(tmpDistroPos, values[i].scanString, distroPart);
          if (distroPart[0] == '"') {
             char *tmpMakeNull;
 
-            tmpDistroPos += strlen(lsbFields[i].name) + 1;
+            tmpDistroPos += strlen(values[i].name) + 1;
             tmpMakeNull = strchr(tmpDistroPos + 1 , '"');
             if (tmpMakeNull != NULL) {
                *tmpMakeNull = '\0';
@@ -759,11 +977,31 @@ HostinfoReadDistroFile(char *filename,  // IN: distro version file name
    }
 
    if (distro[0] == '\0') {
-      /* Copy original string. What we got wasn't LSB compliant. */
-      Str_Strcpy(distro, distroOrig, distroSize);
-   }
+      /*
+       * The distro identification file was not standards compliant.
+       */
 
-   ret = TRUE;
+      if (osReleaseRules) {
+         /*
+          * We must strictly comply with the os-release standard. Error.
+          */
+
+         ret = FALSE;
+      } else {
+         /*
+          * Our old code played fast and loose with the LSB standard. If there
+          * was a distro identification file but the contents were not LSB
+          * compliant (e.g. RH 7.2), we returned success along with the
+          * contents "as is"... in the hopes that the available data would
+          * be "good enough". Continue the practice to maximize compatibility.
+          */
+
+         Str_Strcpy(distro, distroOrig, distroSize);
+         ret = TRUE;
+      }
+   } else {
+      ret = TRUE;
+   }
 
 out:
    if (fd != -1) {
@@ -840,13 +1078,14 @@ HostinfoGetCmdOutput(const char *cmd)  // IN:
          break;
       }
 
-      /* size does -not- include the NUL terminator. */
-      DynBuf_Append(&db, line, size + 1);
+      /* size does not include the NUL terminator. */
+      DynBuf_Append(&db, line, size);
       free(line);
    }
 
-   if (DynBuf_Get(&db)) {
-      out = (char *) DynBuf_AllocGet(&db);
+   /* Return NULL instead of an empty string if there's no output. */
+   if (DynBuf_Get(&db) != NULL) {
+      out = DynBuf_DetachString(&db);
    }
 
  closeIt:
@@ -860,6 +1099,392 @@ HostinfoGetCmdOutput(const char *cmd)  // IN:
    }
    return out;
 }
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * HostinfoOsRelease --
+ *
+ *      Attempt to determine the distro string via the os-release standard.
+ *
+ * Return value:
+ *      TRUE   Success
+ *      FALSE  Failure
+ *
+ * Side effects:
+ *      distro is set on success.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static Bool
+HostinfoOsRelease(char *distro,       // OUT:
+                  size_t distroSize)  // IN:
+{
+   Bool success = HostinfoReadDistroFile(TRUE, "/etc/os-release",
+                                         &osReleaseFields[0],
+                                         distroSize, distro);
+
+   if (!success) {
+      success = HostinfoReadDistroFile(TRUE, "/usr/lib/os-release",
+                                       &osReleaseFields[0],
+                                       distroSize, distro);
+   }
+
+   return success;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * HostinfoLsb --
+ *
+ *      Attempt to determine the distro string via the LSB standard.
+ *
+ * Return value:
+ *      TRUE   Success
+ *      FALSE  Failure
+ *
+ * Side effects:
+ *      distro is set on success.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static Bool
+HostinfoLsb(char *distro,       // OUT:
+            size_t distroSize)  // IN:
+{
+   char *lsbOutput;
+   Bool success = FALSE;
+
+   /*
+    * Try to get OS detailed information from the lsb_release command.
+    */
+
+   lsbOutput = HostinfoGetCmdOutput("/usr/bin/lsb_release -sd 2>/dev/null");
+
+   if (lsbOutput == NULL) {
+      int i;
+
+      /*
+       * Try to get more detailed information from the version file.
+       */
+
+      for (i = 0; distroArray[i].filename != NULL; i++) {
+         if (HostinfoReadDistroFile(FALSE, distroArray[i].filename,
+                                    &lsbFields[0], distroSize, distro)) {
+            success = TRUE;
+            break;
+         }
+      }
+
+      /*
+       * If we failed to read every distro file, exit now, before calling
+       * strlen on the distro buffer (which wasn't set).
+       */
+
+      if (distroArray[i].filename == NULL) {
+         Log("%s: Error: no distro file found\n", __FUNCTION__);
+      }
+   } else {
+      char *lsbStart = lsbOutput;
+      char *quoteEnd = NULL;
+
+      if (lsbStart[0] == '"') {
+         lsbStart++;
+         quoteEnd = strchr(lsbStart, '"');
+         if (quoteEnd) {
+            *quoteEnd = '\0';
+         }
+      }
+      Str_Strcpy(distro, lsbStart, distroSize);
+      free(lsbOutput);
+      success = TRUE;
+   }
+
+   return success;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * HostinfoDefaultLinux --
+ *
+ *      Build and return generic data about the Linux disto. Only return what
+ *      has been required - short description (i.e. guestOS string), long
+ *      description (nice looking string).
+ *
+ * Return value:
+ *      None
+ *
+ * Side effects:
+ *      None
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static void
+HostinfoDefaultLinux(char *distro,            // OUT/OPT:
+                     size_t distroSize,       // IN:
+                     char *distroShort,       // OUT/OPT:
+                     size_t distroShortSize)  // IN:
+{
+   char generic[128];
+   char *distroOut = NULL;
+   char *distroShortOut = NULL;
+   int majorVersion = Hostinfo_OSVersion(0);
+   int minorVersion = Hostinfo_OSVersion(1);
+
+   switch (majorVersion) {
+   case 1:
+      distroOut = STR_OS_OTHER_FULL;
+      distroShortOut = STR_OS_OTHER;
+      break;
+
+   case 2:
+      if (minorVersion < 4) {
+         distroOut = STR_OS_OTHER_FULL;
+         distroShortOut = STR_OS_OTHER;
+      } else if (minorVersion < 6) {
+         distroOut = STR_OS_OTHER_24_FULL;
+         distroShortOut = STR_OS_OTHER_24;
+      } else {
+         distroOut = STR_OS_OTHER_26_FULL;
+         distroShortOut = STR_OS_OTHER_26;
+      }
+
+      break;
+
+   case 3:
+      distroOut = STR_OS_OTHER_3X_FULL;
+      distroShortOut = STR_OS_OTHER_3X;
+      break;
+
+   case 4:
+      distroOut = STR_OS_OTHER_4X_FULL;
+      distroShortOut = STR_OS_OTHER_4X;
+      break;
+
+   default:
+      /*
+       * Anything newer than this code explicitly handles returns the
+       * "highest" known short description and a dynamically created,
+       * appropriate long description.
+       */
+
+      Str_Sprintf(generic, sizeof generic, "Other Linux %d.%d kernel",
+                  majorVersion, minorVersion);
+      distroOut = &generic[0];
+      distroShortOut = STR_OS_OTHER_4X;
+   }
+
+   if (distro != NULL) {
+      ASSERT(distroOut != NULL);
+      Str_Strcpy(distro, distroOut, distroSize);
+   }
+
+   if (distroShort != NULL) {
+      ASSERT(distroShortOut != NULL);
+      Str_Strcpy(distroShort, distroShortOut, distroShortSize);
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * HostinfoLinux --
+ *
+ *      Determine the specifics concerning Linux.
+ *
+ * Return value:
+ *      TRUE   Success
+ *      FALSE  Failure
+ *
+ * Side effects:
+ *      Cache values are set when returning TRUE
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static Bool
+HostinfoLinux(struct utsname *buf)  // IN:
+{
+   int len;
+   char distro[DISTRO_BUF_SIZE];
+   char distroShort[DISTRO_BUF_SIZE];
+   char osName[MAX_OS_NAME_LEN];
+   char osNameFull[MAX_OS_FULLNAME_LEN];
+
+   /* Try the LSB standard first, this maximizes compatibility */
+   if (HostinfoLsb(distro, sizeof distro)) {
+      HostinfoDefaultLinux(NULL, 0, distroShort, sizeof distroShort);
+      HostinfoGetOSShortName(distro, distroShort, sizeof distroShort);
+      goto bail;
+   }
+
+   /* No LSB compliance, try the os-release standard */
+   if (HostinfoOsRelease(distro, sizeof distro)) {
+      HostinfoDefaultLinux(NULL, 0, distroShort, sizeof distroShort);
+      HostinfoGetOSShortName(distro, distroShort, sizeof distroShort);
+      goto bail;
+   }
+
+   /* Not LSB or os-release compliant. Report something generic. */
+   HostinfoDefaultLinux(distro, sizeof distro,
+                        distroShort, sizeof distroShort);
+
+bail:
+
+   len = Str_Snprintf(osNameFull, sizeof osNameFull, "%s %s %s", buf->sysname,
+                      buf->release, distro);
+
+   if (len != -1) {
+      if (Hostinfo_GetSystemBitness() == 64) {
+         len = Str_Snprintf(osName, sizeof osName, "%s%s", distroShort,
+                            STR_OS_64BIT_SUFFIX);
+      } else {
+         len = Str_Snprintf(osName, sizeof osName, "%s", distroShort);
+      }
+   }
+
+   if (len == -1) {
+      Warning("%s: Error: buffer too small\n", __FUNCTION__);
+   } else {
+      HostinfoPostData(osName, osNameFull);
+   }
+
+   return (len != -1);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * HostinfoBSD --
+ *
+ *      Determine the specifics concerning BSD.
+ *
+ * Return value:
+ *      TRUE   Success
+ *      FALSE  Failure
+ *
+ * Side effects:
+ *      Cache values are set when returning TRUE
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static Bool
+HostinfoBSD(struct utsname *buf)  // IN:
+{
+   int len;
+   int majorVersion;
+   char distroShort[DISTRO_BUF_SIZE];
+   char osName[MAX_OS_NAME_LEN];
+   char osNameFull[MAX_OS_FULLNAME_LEN];
+
+   /*
+    * FreeBSD releases report their version as "x.y-RELEASE".
+    */
+
+   majorVersion = Hostinfo_OSVersion(0);
+
+   /*
+    * FreeBSD 11 and later are identified using a different guest ID.
+    */
+   if (majorVersion >= 11) {
+      if (majorVersion >= 12) {
+         Str_Strcpy(distroShort, STR_OS_FREEBSD12, sizeof distroShort);
+      } else {
+         Str_Strcpy(distroShort, STR_OS_FREEBSD11, sizeof distroShort);
+      }
+   } else {
+      Str_Strcpy(distroShort, STR_OS_FREEBSD, sizeof distroShort);
+   }
+
+   len = Str_Snprintf(osNameFull, sizeof osNameFull, "%s %s", buf->sysname,
+                      buf->release);
+
+   if (len != -1) {
+      if (Hostinfo_GetSystemBitness() == 64) {
+         len = Str_Snprintf(osName, sizeof osName, "%s%s", distroShort,
+                            STR_OS_64BIT_SUFFIX);
+      } else {
+         len = Str_Snprintf(osName, sizeof osName, "%s", distroShort);
+      }
+   }
+
+   if (len == -1) {
+      Warning("%s: Error: buffer too small\n", __FUNCTION__);
+   } else {
+      HostinfoPostData(osName, osNameFull);
+   }
+
+   return (len != -1);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * HostinfoSun --
+ *
+ *      Determine the specifics concerning Sun.
+ *
+ * Return value:
+ *      TRUE   Success
+ *      FALSE  Failure
+ *
+ * Side effects:
+ *      None
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+static Bool
+HostinfoSun(struct utsname *buf)  // IN:
+{
+   int len;
+   char osName[MAX_OS_NAME_LEN];
+   char osNameFull[MAX_OS_FULLNAME_LEN];
+   char solarisRelease[3] = "";
+
+   /*
+    * Solaris releases report their version as "x.y". For our supported
+    * releases it seems that x is always "5", and is ignored in favor of "y"
+    * for the version number.
+    */
+
+   if (sscanf(buf->release, "5.%2[0-9]", solarisRelease) != 1) {
+      return FALSE;
+   }
+
+   len = Str_Snprintf(osNameFull, sizeof osNameFull, "%s %s", buf->sysname,
+                      buf->release);
+
+   if (len != -1) {
+      if (Hostinfo_GetSystemBitness() == 64) {
+         len = Str_Snprintf(osName, sizeof osName, "%s%s%s", STR_OS_SOLARIS,
+                            solarisRelease, STR_OS_64BIT_SUFFIX);
+      } else {
+         len = Str_Snprintf(osName, sizeof osName, "%s%s", STR_OS_SOLARIS,
+                            solarisRelease);
+      }
+   }
+
+   if (len == -1) {
+      Warning("%s: Error: buffer too small\n", __FUNCTION__);
+   } else {
+      HostinfoPostData(osName, osNameFull);
+   }
+
+   return (len != -1);
+}
 #endif // !defined __APPLE__ && !defined USERWORLD
 
 
@@ -871,7 +1496,8 @@ HostinfoGetCmdOutput(const char *cmd)  // IN:
  *      Determine the OS short (.vmx format) and long names.
  *
  * Return value:
- *      Returns TRUE on success and FALSE on failure.
+ *      TRUE   Success
+ *      FALSE  Failure
  *
  * Side effects:
  *      Cache values are set when returning TRUE.
@@ -882,11 +1508,8 @@ HostinfoGetCmdOutput(const char *cmd)  // IN:
 Bool
 HostinfoOSData(void)
 {
+   Bool success;
    struct utsname buf;
-   unsigned int lastCharPos;
-   char osName[MAX_OS_NAME_LEN];
-   char osNameFull[MAX_OS_FULLNAME_LEN];
-   static Atomic_uint32 mutex = {0};
 
    /*
     * Use uname to get complete OS information.
@@ -898,362 +1521,23 @@ HostinfoOSData(void)
       return FALSE;
    }
 
-   if (strlen(buf.sysname) + strlen(buf.release) + 3 > sizeof osNameFull) {
-      Warning("%s: Error: buffer too small\n", __FUNCTION__);
-
-      return FALSE;
-   }
-
-   Str_Strcpy(osName, STR_OS_EMPTY, sizeof osName);
-   Str_Sprintf(osNameFull, sizeof osNameFull, "%s %s", buf.sysname,
-               buf.release);
-
-#if defined USERWORLD
-   /* The most recent osName always goes here. */
-   Str_Strcpy(osName, "vmkernel65", sizeof osName);
-
-   /* Handle any special cases */
-   if ((buf.release[0] <= '4') && (buf.release[1] == '.')) {
-      Str_Strcpy(osName, "vmkernel", sizeof osName);
-   } else if ((buf.release[0] == '5') && (buf.release[1] == '.')) {
-      Str_Strcpy(osName, "vmkernel5", sizeof osName);
-   } else if ((buf.release[0] >= '6') && (buf.release[1] == '.')) {
-      if (buf.release[2] < '5') {
-         Str_Strcpy(osName, "vmkernel6", sizeof osName);
-      }
-   }
-
-   Str_Snprintf(osNameFull, sizeof osNameFull, "VMware ESXi %s", buf.release);
-#elif defined __APPLE__
-   {
-      /*
-       * Read the version info from ServerVersion.plist or SystemVersion.plist.
-       * Mac OS Server (10.6 and earlier) has both files, and the product
-       * name in ServerVersion.plist is "Mac OS X Server". Client versions
-       * of Mac OS only have SystemVersion.plist with the name "Mac OS X".
-       *
-       * This is better than executing system_profiler or sw_vers, or using
-       * the deprecated Gestalt() function (which only gets version numbers).
-       * All of those methods just read the same plist files anyway.
-       */
-      static char const *versionPlists[] = {
-         "/System/Library/CoreServices/ServerVersion.plist",
-         "/System/Library/CoreServices/SystemVersion.plist"
-      };
-      unsigned int i;
-      char *productName;
-      char *productVersion;
-      char *productBuildVersion;
-      Bool haveVersion = FALSE;
-
-      for (i = 0; !haveVersion && i < ARRAYSIZE(versionPlists); i++) {
-         CFDictionaryRef versionDict =
-            UtilMacos_CreateCFDictionaryWithContentsOfFile(versionPlists[i]);
-         if (versionDict != NULL) {
-            haveVersion = UtilMacos_ReadSystemVersion(versionDict,
-                                                      &productName,
-                                                      &productVersion,
-                                                      &productBuildVersion);
-            CFRelease(versionDict);
-         }
-      }
-
-      if (haveVersion) {
-         Str_Sprintf(osNameFull, sizeof osNameFull, "%s %s (%s) %s %s",
-                     productName, productVersion, productBuildVersion,
-                     buf.sysname, buf.release);
-         free(productName);
-         free(productVersion);
-         free(productBuildVersion);
-      } else {
-         Log("%s: Failed to read system version plist.\n", __FUNCTION__);
-         /* Fall back to returning the original osNameFull. */
-      }
-
-      Str_Snprintf(osName, sizeof osName, "%s%d", STR_OS_MACOS,
-                   Hostinfo_OSVersion(0));
-   }
+#if defined(USERWORLD)  // ESXi
+   success = HostinfoESX(&buf);
+#elif defined(__APPLE__) // MacOS
+   success = HostinfoMacOS(&buf);
 #else
-   // XXX Use compile-time instead of run-time checks for these as well.
-   if (strstr(osNameFull, "Linux")) {
-      char distro[DISTRO_BUF_SIZE];
-      char distroShort[DISTRO_BUF_SIZE];
-      static int const distroSize = sizeof distro;
-      char *lsbOutput;
-      int majorVersion;
-
-      /*
-       * Write default distro string depending on the kernel version. If
-       * later we find more detailed information this will get overwritten.
-       */
-
-      majorVersion = Hostinfo_OSVersion(0);
-      if (majorVersion < 2) {
-         Str_Strcpy(distro, STR_OS_OTHER_FULL, distroSize);
-         Str_Strcpy(distroShort, STR_OS_OTHER, distroSize);
-      } else if (majorVersion == 2) {
-          if (Hostinfo_OSVersion(1) < 4) {
-            Str_Strcpy(distro, STR_OS_OTHER_FULL, distroSize);
-            Str_Strcpy(distroShort, STR_OS_OTHER, distroSize);
-         } else if (Hostinfo_OSVersion(1) < 6) {
-            Str_Strcpy(distro, STR_OS_OTHER_24_FULL, distroSize);
-            Str_Strcpy(distroShort, STR_OS_OTHER_24, distroSize);
-         } else {
-            Str_Strcpy(distro, STR_OS_OTHER_26_FULL, distroSize);
-            Str_Strcpy(distroShort, STR_OS_OTHER_26, distroSize);
-         }
-      } else if (majorVersion == 3) {
-         Str_Strcpy(distro, STR_OS_OTHER_3X_FULL, distroSize);
-         Str_Strcpy(distroShort, STR_OS_OTHER_3X, distroSize);
-      } else {
-         /*
-          * Anything newer than this code explicitly handles returns the
-          * "highest" known short description and a dynamically created,
-          * appropriate long description.
-          */
-
-         Str_Sprintf(distro, sizeof distro, "Other Linux %d.%d kernel",
-                     majorVersion, Hostinfo_OSVersion(1));
-         Str_Strcpy(distroShort, STR_OS_OTHER_3X, distroSize);
-      }
-
-      /*
-       * Try to get OS detailed information from the lsb_release command.
-       */
-
-      lsbOutput = HostinfoGetCmdOutput("/usr/bin/lsb_release -sd 2>/dev/null");
-      if (lsbOutput == NULL) {
-         int i;
-
-         /*
-          * Try to get more detailed information from the version file.
-          */
-
-         for (i = 0; distroArray[i].filename != NULL; i++) {
-            if (HostinfoReadDistroFile(distroArray[i].filename, distroSize,
-                                       distro)) {
-               break;
-            }
-         }
-
-         /*
-          * If we failed to read every distro file, exit now, before calling
-          * strlen on the distro buffer (which wasn't set).
-          */
-
-         if (distroArray[i].filename == NULL) {
-            Warning("%s: Error: no distro file found\n", __FUNCTION__);
-
-            return FALSE;
-         }
-      } else {
-         char *lsbStart = lsbOutput;
-         char *quoteEnd = NULL;
-
-         if (lsbStart[0] == '"') {
-            lsbStart++;
-            quoteEnd = strchr(lsbStart, '"');
-            if (quoteEnd) {
-               *quoteEnd = '\0';
-            }
-         }
-         Str_Strcpy(distro, lsbStart, distroSize);
-         free(lsbOutput);
-      }
-
-      HostinfoGetOSShortName(distro, distroShort, distroSize);
-
-      if (strlen(distro) + strlen(osNameFull) + 2 > sizeof osNameFull) {
-         Warning("%s: Error: buffer too small\n", __FUNCTION__);
-
-         return FALSE;
-      }
-
-      Str_Strcat(osNameFull, " ", sizeof osNameFull);
-      Str_Strcat(osNameFull, distro, sizeof osNameFull);
-
-      if (strlen(distroShort) + 1 > sizeof osName) {
-         Warning("%s: Error: buffer too small\n", __FUNCTION__);
-
-         return FALSE;
-      }
-
-      Str_Strcpy(osName, distroShort, sizeof osName);
-   } else if (strstr(osNameFull, "FreeBSD")) {
-      size_t nameLen = sizeof STR_OS_FREEBSD - 1;
-      size_t releaseLen = 0;
-      char *dashPtr;
-
-      /*
-       * FreeBSD releases report their version as "x.y-RELEASE". We'll be
-       * naive look for the first dash, and use everything before it as the
-       * version number.
-       */
-
-      dashPtr = Str_Strchr(buf.release, '-');
-      if (dashPtr != NULL) {
-         releaseLen = dashPtr - buf.release;
-      }
-
-      if (nameLen + releaseLen + 1 > sizeof osName) {
-         Warning("%s: Error: buffer too small\n", __FUNCTION__);
-
-         return FALSE;
-      }
-
-      Str_Strcpy(osName, STR_OS_FREEBSD, sizeof osName);
-   } else if (strstr(osNameFull, "SunOS")) {
-      size_t nameLen = sizeof STR_OS_SOLARIS - 1;
-      size_t releaseLen = 0;
-      char solarisRelease[3] = "";
-
-      /*
-       * Solaris releases report their version as "x.y". For our supported
-       * releases it seems that x is always "5", and is ignored in favor of
-       * "y" for the version number.
-       */
-
-      if (sscanf(buf.release, "5.%2[0-9]", solarisRelease) == 1) {
-         releaseLen = strlen(solarisRelease);
-      }
-
-      if (nameLen + releaseLen + 1 > sizeof osName) {
-         Warning("%s: Error: buffer too small\n", __FUNCTION__);
-
-         return FALSE;
-      }
-
-      Str_Snprintf(osName, sizeof osName, "%s%s", STR_OS_SOLARIS,
-                   solarisRelease);
+   if (strstr(buf.sysname, "Linux")) {
+      success = HostinfoLinux(&buf);
+   } else if (strstr(buf.sysname, "FreeBSD")) {
+      success = HostinfoBSD(&buf);
+   } else if (strstr(buf.sysname, "SunOS")) {
+      success = HostinfoSun(&buf);
+   } else {
+      success = FALSE;  // Unknown to us
    }
 #endif
 
-#ifndef USERWORLD
-   if (Hostinfo_GetSystemBitness() == 64) {
-      if (strlen(osName) + sizeof STR_OS_64BIT_SUFFIX > sizeof osName) {
-         Warning("%s: Error: buffer too small\n", __FUNCTION__);
-
-         return FALSE;
-      }
-      Str_Strcat(osName, STR_OS_64BIT_SUFFIX, sizeof osName);
-   }
-#endif
-
-   /*
-    * Before returning, truncate the \n character at the end of the full name.
-    */
-
-   lastCharPos = strlen(osNameFull) - 1;
-   if (osNameFull[lastCharPos] == '\n') {
-      osNameFull[lastCharPos] = '\0';
-   }
-
-   /*
-    * Serialize access. Collisions should be rare - plus the value will
-    * get cached and this won't get called anymore.
-    */
-
-   while (Atomic_ReadWrite(&mutex, 1)); // Spinlock.
-
-   if (!HostinfoOSNameCacheValid) {
-      Str_Strcpy(HostinfoCachedOSName, osName, sizeof HostinfoCachedOSName);
-      Str_Strcpy(HostinfoCachedOSFullName, osNameFull,
-                 sizeof HostinfoCachedOSFullName);
-      HostinfoOSNameCacheValid = TRUE;
-   }
-
-   Atomic_Write(&mutex, 0);  // unlock
-
-   return TRUE;
-}
-
-
-/*
- *-----------------------------------------------------------------------------
- *
- * Hostinfo_CPUCounts --
- *
- *      Get a count of CPUs for the host.
- *        pkgs := total number of sockets/packages
- *        cores := total number of actual cores (not including hyperthreads)
- *        logical := total schedulable threads, as seen by host scheduler
- *      Depending on available host OS interfaces, these numbers may be
- *      either "active" or "possible", so do not depend upon them for
- *      precision.
- *
- *      As an example, a 2 socket Nehalem (4 cores + HT) would return:
- *        pkgs = 2, cores = 8, logical = 16
- *
- *      Again, this interface is generally not useful b/c of its potential
- *      inaccuracy (especially with hotplug!) and because it is only implemented
- *      for a few OSes.
- *
- *      If you are trying to use this interface, it probably means you are doing
- *      something 'clever' with licensing.  Don't.
- *
- * Results:
- *      TRUE if sane numbers are populated, FALSE otherwise.
- *
- * Side effects:
- *      None
- *
- *-----------------------------------------------------------------------------
- */
-
-Bool
-Hostinfo_CPUCounts(uint32 *logical,  // OUT
-                   uint32 *cores,    // OUT
-                   uint32 *pkgs)     // OUT
-{
-#if defined __APPLE__
-   /*
-    * Lame logic.  Because Apple doesn't really expose this info,
-    * we'd only use it for licensing anyway, and we just plain
-    * don't need it on Apple except that VMHS stuffs it somewhere
-    * and may result in a division-by-zero if we don't provide it.
-    */
-   *logical = Hostinfo_NumCPUs();
-   *pkgs = *logical > 4 ? 2 : 1;
-   *cores = *logical / *pkgs;
-
-   return TRUE;
-#elif defined __linux__
-   FILE *f;
-   char *line;
-   unsigned count = 0, coresPerProc = 0, siblingsPerProc = 0;
-
-   f = Posix_Fopen("/proc/cpuinfo", "r");
-   if (f == NULL) {
-      return FALSE;
-   }
-
-   while (StdIO_ReadNextLine(f, &line, 0, NULL) == StdIO_Success) {
-      if (strncmp(line, "processor", strlen("processor")) == 0) {
-         count++;
-      }
-      /* Assume all processors are identical, so just read the first. */
-      if (coresPerProc == 0) {
-         sscanf(line, "cpu cores : %u", &coresPerProc);
-      }
-      if (siblingsPerProc == 0) {
-         sscanf(line, "siblings : %u", &siblingsPerProc);
-      }
-      free(line);
-   }
-
-   fclose(f);
-
-   *logical = count;
-   *pkgs = siblingsPerProc > 0 ? count / siblingsPerProc : count;
-   *cores = coresPerProc > 0 ? *pkgs * coresPerProc : *pkgs;
-
-   Log(LGPFX" This machine has %u physical CPUS, %u total cores, and %u "
-            "logical CPUs.\n", *pkgs, *cores, *logical);
-
-   return TRUE;
-#else
-   NOT_IMPLEMENTED();
-#endif
+   return success;
 }
 
 
@@ -1380,46 +1664,6 @@ Hostinfo_NumCPUs(void)
 
    return count;
 #endif
-}
-
-
-/*
- *----------------------------------------------------------------------
- *
- * Hostinfo_OSIsSMP --
- *
- *      Host OS SMP capability.
- *
- * Results:
- *      TRUE is host OS is SMP capable.
- *
- * Side effects:
- *      None.
- *
- *----------------------------------------------------------------------
- */
-
-Bool
-Hostinfo_OSIsSMP(void)
-{
-   uint32 ncpu;
-
-#if defined(__APPLE__)
-   size_t ncpuSize = sizeof ncpu;
-
-   if (sysctlbyname("hw.ncpu", &ncpu, &ncpuSize, NULL, 0) == -1) {
-      return FALSE;
-   }
-
-#else
-   ncpu = Hostinfo_NumCPUs();
-
-   if (ncpu == 0xFFFFFFFF) {
-      return FALSE;
-   }
-#endif
-
-   return ncpu > 1 ? TRUE : FALSE;
 }
 
 
@@ -1629,19 +1873,27 @@ Hostinfo_LogLoadAverage(void)
 }
 
 
+#if __APPLE__
 /*
  *-----------------------------------------------------------------------------
  *
- * HostinfoGetTimeOfDayMonotonic --
+ * HostinfoSystemTimerMach --
  *
- *      Return the system time as indicated by Hostinfo_GetTimeOfDay(), with
- *      locking to ensure monotonicity.
+ *      Returns system time based on a monotonic, nanosecond-resolution,
+ *      fast timer provided by the Mach kernel. Requires speed conversion
+ *      so is non-trivial (but lockless).
  *
- *      Uses OS native locks as lib/lock is not available in lib/misc.  This
- *      is safe because nothing occurs while locked that can be reentrant.
+ *      See also Apple TechNote QA1398.
+ *
+ *      NOTE: on x86, macOS does TSC->ns conversion in the commpage
+ *      for mach_absolute_time() to correct for speed-stepping, so x86
+ *      should always be 1:1 a.k.a. 'unity'.
+ *
+ *      On iOS, mach_absolute_time() uses an ARM register and always
+ *      needs conversion.
  *
  * Results:
- *      The time in microseconds is returned. Zero upon error.
+ *      Current value of timer
  *
  * Side effects:
  *	None.
@@ -1650,183 +1902,79 @@ Hostinfo_LogLoadAverage(void)
  */
 
 static VmTimeType
-HostinfoGetTimeOfDayMonotonic(void)
+HostinfoSystemTimerMach(void)
 {
-   VmTimeType newTime;
-   VmTimeType curTime;
+   static Atomic_uint64 machToNS;
 
-   static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+   union {
+      uint64 raw;
+      RateConv_Ratio ratio;
+   } u;
+   VmTimeType result;
 
-   static VmTimeType lastTimeBase;
-   static VmTimeType lastTimeRead;
-   static VmTimeType lastTimeReset;
+   u.raw = Atomic_Read64(&machToNS);
 
-   pthread_mutex_lock(&mutex);  // Use native mechanism, just like Windows
-
-   Hostinfo_GetTimeOfDay(&curTime);
-
-   if (curTime == 0) {
-      newTime = 0;
-      goto exit;
-   }
-
-   /*
-    * Don't let time be negative or go backward.  We do this by tracking a
-    * base and moving forward from there.
-    */
-
-   newTime = lastTimeBase + (curTime - lastTimeReset);
-
-   if (newTime < lastTimeRead) {
-      lastTimeReset = curTime;
-      lastTimeBase = lastTimeRead + 1;
-      newTime = lastTimeBase + (curTime - lastTimeReset);
-   }
-
-   lastTimeRead = newTime;
-
-exit:
-   pthread_mutex_unlock(&mutex);
-
-   return newTime;
-}
-
-
-/*
- *-----------------------------------------------------------------------------
- *
- * HostinfoSystemTimerMach --
- * HostinfoSystemTimerPosix --
- *
- *      Returns system time based on a monotonic, nanosecond-resolution,
- *      fast timer provided by the (relevant) operating system.
- *
- *      Caller should check return value, as some variants may not be known
- *      to be absent until runtime.  Where possible, these functions collapse
- *      into constants at compile-time.
- *
- * Results:
- *      TRUE if timer is available; FALSE to indicate unavailability.
- *      If available, the current time is returned via 'result'.
- *
- * Side effects:
- *	None.
- *
- *-----------------------------------------------------------------------------
- */
-
-static Bool
-HostinfoSystemTimerMach(VmTimeType *result)  // OUT
-{
-#if __APPLE__
-#  define vmx86_apple 1
-
-   typedef struct {
-      double  scalingFactor;
-      Bool    unity;
-   } timerData;
-
-   VmTimeType raw;
-   timerData *ptr;
-   static Atomic_Ptr atomic; /* Implicitly initialized to NULL. --mbellon */
-
-   /*
-    * On Mac OS a commpage timer is used. Such timers are ensured to never
-    * go backwards - and be valid across all processes.
-    */
-
-   /* Ensure that the time base values are correct. */
-   ptr = Atomic_ReadPtr(&atomic);
-
-   if (UNLIKELY(ptr == NULL)) {
+   if (UNLIKELY(u.raw == 0)) {
       mach_timebase_info_data_t timeBase;
-      timerData *try = Util_SafeMalloc(sizeof *try);
+      kern_return_t kr;
 
-      mach_timebase_info(&timeBase);
+      /* Ensure atomic works correctly */
+      ASSERT_ON_COMPILE(sizeof u == sizeof(machToNS));
 
-      try->scalingFactor = ((double) timeBase.numer) /
-                           ((double) timeBase.denom);
+      kr = mach_timebase_info(&timeBase);
+      ASSERT(kr == KERN_SUCCESS);
 
-      try->unity = ((timeBase.numer == 1) && (timeBase.denom == 1));
-
-      if (Atomic_ReadIfEqualWritePtr(&atomic, NULL, try)) {
-         free(try);
+      /*
+       * Officially, TN QA1398 recommends using a static variable and
+       *    NS = mach_absolute_time() * timeBase.numer / timebase.denom
+       * (where denom != 0 is an obvious init check).
+       * In practice...
+       * x86 (incl x86_64) has only been seen using 1/1
+       * iOS has been seen to use 125/3 (~24MHz)
+       * PPC has been seen to use 1000000000/33333335 (~33MHz),
+       *     which overflows 64-bit multiply in ~8 seconds (!!)
+       *     (2^63 signed bits / 2^30 numer / 2^30 ns/sec ~= 2^3)
+       * We will use fixed-point for everything because it's faster
+       * than floating point and (with a 128-bit multiply) cannot overflow.
+       * Even in the 'unity' case, the four instructions in x86_64 fixed-point
+       * are about as expensive as checking for 'unity'.
+       */
+      if (timeBase.numer == 1 && timeBase.denom == 1) {
+         u.ratio.mult = 1;  // Trivial conversion
+         u.ratio.shift = 0;
+      } else {
+         Bool status;
+         status = RateConv_ComputeRatio(timeBase.denom, timeBase.numer,
+                                        &u.ratio);
+         VERIFY(status);  // Assume we can get fixed-point parameters
       }
 
-      ptr = Atomic_ReadPtr(&atomic);
+      /*
+       * Use ReadWrite for implicit barrier.
+       * Initialization is idempotent, so no multi-init worries.
+       * The fixed-point conversions are stored in an atomic to ensure
+       * they are never read "torn".
+       */
+      Atomic_ReadWrite64(&machToNS, u.raw);
+      ASSERT(u.raw != 0);  // Used as initialization check
    }
 
-   raw = mach_absolute_time();
+   /* Fixed-point */
+   result = Muls64x32s64(mach_absolute_time(),
+                         u.ratio.mult, u.ratio.shift);
 
-   if (LIKELY(ptr->unity)) {
-      *result = raw;
-   } else {
-      *result = ((double) raw) * ptr->scalingFactor;
-   }
+   /*
+    * A smart programmer would use a global variable to ASSERT that
+    * mach_absolute_time() and/or the fixed-point result is non-decreasing.
+    * This turns out to be impractical: the synchronization needed to safely
+    * make that check can prevent the very effect being checked.
+    * Thus, we simply trust the documentation.
+    */
 
-   return TRUE;
-#else
-#  define vmx86_apple 0
-   return FALSE;
-#endif
+   ASSERT(result >= 0);
+   return result;
 }
-
-static Bool
-HostinfoSystemTimerPosix(VmTimeType *result)  // OUT
-{
-#if defined(_POSIX_TIMERS) && _POSIX_TIMERS > 0 && defined(_POSIX_MONOTONIC_CLOCK)
-#  define vmx86_posix 1
-   /* Weak declaration to avoid librt.so dependency */
-   extern int clock_gettime(clockid_t clk_id, struct timespec *tp) __attribute__ ((weak));
-
-   /* Assignment is idempotent (expected to always be same answer). */
-   static volatile enum { UNKNOWN, PRESENT, FAILED } hasGetTime = UNKNOWN;
-
-   struct timespec ts;
-   int ret;
-
-   switch (hasGetTime) {
-   case FAILED:
-      break;
-   case UNKNOWN:
-      if (clock_gettime == NULL) {
-         /* librt.so is not present.  No clock_gettime() */
-         hasGetTime = FAILED;
-         break;
-      }
-      ret = clock_gettime(CLOCK_MONOTONIC, &ts);
-      if (ret != 0) {
-         hasGetTime = FAILED;
-         /*
-          * Well-understood error codes:
-          * ENOSYS, OS does not implement syscall
-          * EINVAL, OS implements syscall but not CLOCK_MONOTONIC
-          */
-         if (errno != ENOSYS && errno != EINVAL) {
-            Log("%s: failure, err %d!\n", __FUNCTION__, errno);
-         }
-         break;
-      }
-      hasGetTime = PRESENT;
-      /* Fall through to 'case PRESENT' */
-
-   case PRESENT:
-      ret = clock_gettime(CLOCK_MONOTONIC, &ts);
-      ASSERT(ret == 0);
-      *result = (VmTimeType)ts.tv_sec * 1000 * 1000 * 1000 + ts.tv_nsec;
-      return TRUE;
-   }
-   return FALSE;
-#else
-#if vmx86_server
-#  error Posix clock_gettime support required on ESX
 #endif
-#  define vmx86_posix 0
-   /* No Posix support for clock_gettime() */
-   return FALSE;
-#endif
-}
-
 
 /*
  *-----------------------------------------------------------------------------
@@ -1834,16 +1982,11 @@ HostinfoSystemTimerPosix(VmTimeType *result)  // OUT
  * Hostinfo_SystemTimerNS --
  *
  *      Return the time.
- *         - These timers are documented to never go backwards.
- *         - These timers may take locks
+ *         - These timers are documented to be non-decreasing
+ *         - These timers never take locks
  *
  * NOTES:
  *      These are the routines to use when performing timing measurements.
- *
- *      The value returned is valid (finish-time - start-time) only within a
- *      single process. Don't send a time measurement obtained with these
- *      routines to another process and expect a relative time measurement
- *      to be correct.
  *
  *      The actual resolution of these "clocks" are undefined - it varies
  *      depending on hardware, OSen and OS versions.
@@ -1852,7 +1995,7 @@ HostinfoSystemTimerPosix(VmTimeType *result)  // OUT
  *     while RANK_logLock is held. ***
  *
  * Results:
- *      The time in nanoseconds is returned. Zero upon error.
+ *      The time in nanoseconds is returned.
  *
  * Side effects:
  *	None.
@@ -1863,19 +2006,25 @@ HostinfoSystemTimerPosix(VmTimeType *result)  // OUT
 VmTimeType
 Hostinfo_SystemTimerNS(void)
 {
-   VmTimeType result = 0;  // = 0 silence compiler warning
+#ifdef __APPLE__
+   return HostinfoSystemTimerMach();
+#else
+   struct timespec ts;
+   int ret;
 
-   if ((vmx86_apple && HostinfoSystemTimerMach(&result)) ||
-       (vmx86_posix && HostinfoSystemTimerPosix(&result))) {
-      /* Host provides monotonic clock source. */
-      return result;
-   } else {
-      /* GetTimeOfDay is microseconds. */
-      return HostinfoGetTimeOfDayMonotonic() * 1000;
-   }
+   /*
+    * clock_gettime() is implemented on Linux as a commpage routine that
+    * adds a known offset to TSC, which makes it very fast. Other OSes...
+    * are at worst a single syscall (see: vmkernel PR820064), which still
+    * makes this the best time API. Also, clock_gettime() allows nanosecond
+    * resolution and any alternative is worse: gettimeofday() is microsecond.
+    */
+   ret = clock_gettime(CLOCK_MONOTONIC, &ts);
+   ASSERT(ret == 0);
+
+   return (VmTimeType)ts.tv_sec * 1000 * 1000 * 1000 + ts.tv_nsec;
+#endif
 }
-#undef vmx86_apple
-#undef vmx86_posix
 
 
 /*
@@ -2655,28 +2804,19 @@ Hostinfo_GetCpuDescription(uint32 cpuNumber)  // IN:
    return HostinfoGetSysctlStringAlloc("machdep.cpu.brand_string");
 #elif defined(__FreeBSD__)
    return HostinfoGetSysctlStringAlloc("hw.model");
-#else
-#ifdef VMX86_SERVER
-#ifdef VM_ARM_64
-   return strdup("armv8 unknown");
-#else
-   if (HostType_OSIsVMK()) {
-      char mName[48];
+#elif defined VMX86_SERVER
+   /* VMKernel treats mName as an in/out parameter so terminate it. */
+   char mName[64] = { 0 };
 
-      /* VMKernel treats mName as an in/out parameter so terminate it. */
-      mName[0] = '\0';
-      if (VMKernel_GetCPUModelName(cpuNumber, mName,
-                                   sizeof(mName)) == VMK_OK) {
-         mName[sizeof(mName) - 1] = '\0';
+   if (VMKernel_GetCPUModelName(cpuNumber, mName,
+                                sizeof(mName)) == VMK_OK) {
+      mName[sizeof(mName) - 1] = '\0';
 
-         return strdup(mName);
-      }
-
-      return NULL;
+      return strdup(mName);
    }
-#endif // VM_ARM_64
-#endif // VMX86_SERVER
 
+   return NULL;
+#else
    return HostinfoGetCpuInfo(cpuNumber, "model name");
 #endif
 }
@@ -2785,141 +2925,12 @@ Hostinfo_Execute(const char *path,   // IN:
  *
  * 3) In Mac OS 10.7, Apple cleaned their mess and solved all the above
  *    problems by introducing a new mach_zone_info() Mach call. So this is what
- *    we use now, when available. Was bug 816610.
+ *    we use now. Was bug 816610.
  *
  * 4) In Mac OS 10.8, Apple appears to have modified mach_zone_info() to always
  *    return KERN_INVALID_HOST(!) when the calling process (not the calling
  *    thread!) is not root.
  */
-
-
-#if MAC_OS_X_VERSION_MIN_REQUIRED < 1070 // Must run on Mac OS versions < 10.7
-/*
- *-----------------------------------------------------------------------------
- *
- * HostinfoGetKernelZoneElemSizeZprint --
- *
- *      Retrieve the size of the elements in a named kernel zone, by invoking
- *      zprint.
- *
- * Results:
- *      On success: the size (in bytes) > 0.
- *      On failure: 0.
- *
- * Side effects:
- *      None
- *
- *-----------------------------------------------------------------------------
- */
-
-static size_t
-HostinfoGetKernelZoneElemSizeZprint(char const *name) // IN: Kernel zone name
-{
-   size_t retval = 0;
-   struct {
-      size_t retval;
-   } volatile *shared;
-   pid_t child;
-   pid_t pid;
-
-   /*
-    * popen(3) incorrectly executes the shell with the identity of the calling
-    * process, ignoring a potential per-thread identity. And starting with
-    * Mac OS 10.6 it is even worse: if there is a per-thread identity,
-    * popen(3) removes it!
-    *
-    * So we run this code in a separate process which runs with the same
-    * identity as the current thread.
-    */
-
-   shared = mmap(NULL, sizeof *shared, PROT_READ | PROT_WRITE,
-                 MAP_ANON | MAP_SHARED, -1, 0);
-
-   if (shared == (void *)-1) {
-      Warning("%s: mmap error %d.\n", __FUNCTION__, errno);
-
-      return retval;
-   }
-
-   // In case the child is terminated before it can set it.
-   shared->retval = retval;
-
-   child = fork();
-   if (child == (pid_t)-1) {
-      Warning("%s: fork error %d.\n", __FUNCTION__, errno);
-      munmap((void *)shared, sizeof *shared);
-
-      return retval;
-   }
-
-   // This executes only in the child process.
-   if (!child) {
-      size_t nameLen;
-      FILE *stream;
-      Bool parsingProperties = FALSE;
-
-      ASSERT(name);
-
-      nameLen = strlen(name);
-      ASSERT(nameLen && *name != '\t');
-
-      stream = popen("/usr/bin/zprint -C", "r");
-      if (!stream) {
-         Warning("%s: popen error %d.\n", __FUNCTION__, errno);
-         exit(EXIT_SUCCESS);
-      }
-
-      for (;;) {
-         char *line;
-         size_t lineLen;
-
-         if (StdIO_ReadNextLine(stream, &line, 0,
-                                &lineLen) != StdIO_Success) {
-            break;
-         }
-
-         if (parsingProperties) {
-            if (   // Not a property line anymore. Property not found.
-                   lineLen < 1 || memcmp(line, "\t", 1)
-                   // Property found.
-                || sscanf(line, " elem_size: %"FMTSZ"u bytes",
-                          &shared->retval) == 1) {
-               free(line);
-               break;
-            }
-         } else if (!(lineLen < nameLen + 6 ||
-                    memcmp(line, name, nameLen) ||
-                    memcmp(line + nameLen, " zone:", 6))) {
-            // Zone found.
-            parsingProperties = TRUE;
-         }
-
-         free(line);
-      }
-
-      pclose(stream);
-      exit(EXIT_SUCCESS);
-   }
-
-   /*
-    * This executes only in the parent process.
-    * Wait for the child to terminate, and return its retval.
-    */
-
-   do {
-      int status;
-
-      pid = waitpid(child, &status, 0);
-   } while ((pid == -1) && (errno == EINTR));
-
-   VERIFY(pid == child);
-
-   retval = shared->retval;
-   munmap((void *)shared, sizeof *shared);
-
-   return retval;
-}
-#endif
 
 
 /*
@@ -2942,21 +2953,6 @@ HostinfoGetKernelZoneElemSizeZprint(char const *name) // IN: Kernel zone name
 size_t
 Hostinfo_GetKernelZoneElemSize(char const *name) // IN: Kernel zone name
 {
-#if MAC_OS_X_VERSION_MAX_ALLOWED < 1070 // Compiles against SDK version < 10.7
-   typedef struct {
-      char mzn_name[80];
-   } mach_zone_name_t;
-   typedef struct {
-      uint64_t mzi_count;
-      uint64_t mzi_cur_size;
-      uint64_t mzi_max_size;
-      uint64_t mzi_elem_size;
-      uint64_t mzi_alloc_size;
-      uint64_t mzi_sum_size;
-      uint64_t mzi_exhaustible;
-      uint64_t mzi_collectable;
-   } mach_zone_info_t;
-#endif
    size_t result = 0;
    mach_zone_name_t *namesPtr;
    mach_msg_type_number_t namesSize;
@@ -2964,16 +2960,6 @@ Hostinfo_GetKernelZoneElemSize(char const *name) // IN: Kernel zone name
    mach_msg_type_number_t infosSize;
    kern_return_t kr;
    mach_msg_type_number_t i;
-
-#if MAC_OS_X_VERSION_MIN_REQUIRED < 1070 // Must run on Mac OS versions < 10.7
-   kern_return_t (*mach_zone_info)(host_t host,
-      mach_zone_name_t **names, mach_msg_type_number_t *namesCnt,
-      mach_zone_info_t **info, mach_msg_type_number_t *infoCnt) =
-         dlsym(RTLD_DEFAULT, "mach_zone_info");
-   if (!mach_zone_info) {
-      return HostinfoGetKernelZoneElemSizeZprint(name);
-   }
-#endif
 
    ASSERT(name);
 
